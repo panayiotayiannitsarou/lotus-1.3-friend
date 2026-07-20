@@ -1098,73 +1098,14 @@ class UnifiedProcessor:
                     break
         return result
 
-    def _pedagogical_pair_penalty(self, name_a: str, name_b: str) -> int:
-        """
-        Επιστρέφει την παιδαγωγική ποινή Pped για μία συνύπαρξη:
-        - 5: δύο μαθητές με ΙΔΙΑΙΤΕΡΟΤΗΤΑ=Ν
-        - 4: μαθητής με ΙΔΙΑΙΤΕΡΟΤΗΤΑ=Ν μαζί με μαθητή με συμπεριφορική ένδειξη
-        - 3: δύο μαθητές με συμπεριφορική ένδειξη
-
-        Αν ισχύουν περισσότερες από μία περιπτώσεις, κρατείται η μεγαλύτερη
-        ποινή. Οι τιμές ΖΩΗΡΟΣ Ν, Ν1, Ν2 ή Ν3 θεωρούνται συμπεριφορική ένδειξη.
-        """
-        data_a = self.students_data.get(name_a)
-        data_b = self.students_data.get(name_b)
-        if data_a is None or data_b is None:
-            return 0
-
-        def _is_special(data: StudentData) -> bool:
-            return str(data.special_needs).strip().upper() in {'Ν', 'N'}
-
-        def _is_behavioral(data: StudentData) -> bool:
-            value = str(data.calm).strip().upper()
-            return value in {'Ν', 'N', 'Ν1', 'N1', 'Ν2', 'N2', 'Ν3', 'N3'}
-
-        special_a, special_b = _is_special(data_a), _is_special(data_b)
-        behavior_a, behavior_b = _is_behavioral(data_a), _is_behavioral(data_b)
-
-        penalties = [0]
-        if special_a and special_b:
-            penalties.append(5)
-        if (special_a and behavior_b) or (special_b and behavior_a):
-            penalties.append(4)
-        if behavior_a and behavior_b:
-            penalties.append(3)
-        return max(penalties)
-
-    def _calculate_total_pped(self, teams: Optional[Dict[str, List[str]]] = None) -> int:
-        """Υπολογίζει το συνολικό Pped όλων των τμημάτων."""
-        teams_map = teams if teams is not None else self.teams
-        total = 0
-        for names in teams_map.values():
-            for i, name_a in enumerate(names):
-                for name_b in names[i + 1:]:
-                    total += self._pedagogical_pair_penalty(name_a, name_b)
-        return total
-
-    def _pped_after_hypothetical_swap(
-        self, from_team: str, names_out: List[str],
-        to_team: str, names_in: List[str],
-    ) -> int:
-        """Υπολογίζει το Pped μετά από υποθετική ισομεγέθη ανταλλαγή."""
-        hypothetical = {team: list(names) for team, names in self.teams.items()}
-        for name in names_out:
-            if name in hypothetical.get(from_team, []):
-                hypothetical[from_team].remove(name)
-        for name in names_in:
-            if name in hypothetical.get(to_team, []):
-                hypothetical[to_team].remove(name)
-        hypothetical[from_team].extend(names_in)
-        hypothetical[to_team].extend(names_out)
-        return self._calculate_total_pped(hypothetical)
-
     def _optional_swap_preserves_higher_rules(
         self, stats_before: Dict, from_team: str, names_out: List[str],
         to_team: str, names_in: List[str], max_ep: int, max_gr: int, max_gen: int,
     ) -> bool:
         """
         Ο Κύκλος 3 δεν επιδεινώνει κανένα ανώτερο κριτήριο: σύγκρουση,
-        επίδοση, ελληνικά, φύλο και συνολικό Pped.
+        επίδοση, ελληνικά και φύλο. Οι μαθητές των Βημάτων 1–2 είναι locked,
+        επομένως δεν μετακινούνται και το Pped παραμένει αμετάβλητο.
         """
         if self._swap_creates_conflict(from_team, names_out, to_team, names_in):
             return False
@@ -1180,14 +1121,6 @@ class UnifiedProcessor:
         if gender_after > gender_before or gender_after > max(max_gen, gender_before):
             return False
 
-        # ΝΕΟ HARD GUARD: η κοινωνική αποκατάσταση δεν επιτρέπεται να
-        # αυξήσει το συνολικό παιδαγωγικό φορτίο Pped.
-        pped_before = self._calculate_total_pped()
-        pped_after = self._pped_after_hypothetical_swap(
-            from_team, names_out, to_team, names_in
-        )
-        if pped_after > pped_before:
-            return False
 
         return True
 

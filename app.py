@@ -301,7 +301,7 @@ def _story_md():
 """
 
 STEP8_MODULE_CANDIDATES = [
-    ROOT / "step8_fixed_final_SECOND_THIRD_CHOICE_PPED.py",
+    ROOT / "step8_fixed_final_SECOND_THIRD_CHOICE.py",
     ROOT / "step8_fixed_final_SECOND_CHOICE_MAX2_PPED.py",
     ROOT / "step8_fixed_final_OPTIONAL_FRIEND_MAX2_PPED.py",
     ROOT / "step8_fixed_final_OPTIONAL_FRIEND.py",
