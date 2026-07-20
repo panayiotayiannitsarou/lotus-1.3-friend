@@ -1723,7 +1723,7 @@ class UnifiedProcessor:
         for team_name in sorted(self.teams.keys()):
             self._create_team_sheet(wb, team_name)
         
-        self._create_statistics_sheet(wb, final_spreads)
+        self._create_statistics_sheet(wb, final_spreads, applied_swaps)
         self._create_swaps_log_sheet(wb, applied_swaps)
         
         wb.save(output_path)
@@ -1807,7 +1807,7 @@ class UnifiedProcessor:
         for col_letter, width in widths.items():
             sheet.column_dimensions[col_letter].width = width
     
-    def _create_statistics_sheet(self, wb: Workbook, spreads: Dict) -> None:
+    def _create_statistics_sheet(self, wb: Workbook, spreads: Dict, applied_swaps: List[Dict]) -> None:
         """Δημιουργία πλήρους φύλλου ΒΕΛΤΙΩΜΕΝΗ_ΣΤΑΤΙΣΤΙΚΗ."""
         sheet = wb.create_sheet('ΒΕΛΤΙΩΜΕΝΗ_ΣΤΑΤΙΣΤΙΚΗ')
 
@@ -1816,6 +1816,7 @@ class UnifiedProcessor:
             'Γνώση (ΝΑΙ)', 'Γνώση (ΟΧΙ)',
             'Παιδιά Εκπαιδευτικών', 'Ζωηροί', 'Ιδιαιτερότητα',
             'Συγκρούσεις', 'Σπασμένες Φιλίες',
+            'Εφαρμογή 2ης Επιλογής', 'Εφαρμογή 3ης Επιλογής',
             'Επ1', 'Επ2', 'Επ3', 'Επ4', 'Επ5'
         ]
 
@@ -1827,6 +1828,27 @@ class UnifiedProcessor:
             cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
 
         stats = self._get_team_stats()
+
+        # Κύκλος 3: μετράμε μόνο τις επιλογές που ΕΦΑΡΜΟΣΤΗΚΑΝ πραγματικά
+        # για locked μαθητή με σπασμένη βασική αμοιβαία φιλία. Η βασική
+        # φιλία παραμένει καταγεγραμμένη ως σπασμένη, επειδή η δεύτερη/τρίτη
+        # επιλογή παρέχει εναλλακτική κοινωνική υποστήριξη και δεν την αντικαθιστά.
+        second_choice_by_team = {team: 0 for team in self.teams}
+        third_choice_by_team = {team: 0 for team in self.teams}
+        for swap in applied_swaps:
+            if swap.get('cycle') != 3:
+                continue
+            social = swap.get('social_restoration', {}) or {}
+            target_team = swap.get('from_team')  # τμήμα του locked μαθητή
+            choice_column = social.get('choice_column', '')
+            priority = social.get('optional_priority')
+            if target_team not in self.teams:
+                continue
+            if choice_column == 'ΔΕΥΤΕΡΗ_ΕΠΙΛΟΓΗ' or priority == 1:
+                second_choice_by_team[target_team] += 1
+            elif choice_column == 'ΤΡΙΤΗ_ΕΠΙΛΟΓΗ' or priority == 2:
+                third_choice_by_team[target_team] += 1
+
         row_idx = 2
 
         for team_name in sorted(self.teams.keys()):
@@ -1846,6 +1868,8 @@ class UnifiedProcessor:
                 s['special_count'],
                 s['conflict_violations'],
                 s['broken_friendships'],
+                second_choice_by_team.get(team_name, 0),
+                third_choice_by_team.get(team_name, 0),
                 s['ep1'],
                 s['ep2'],
                 s['ep3'],
@@ -1902,7 +1926,7 @@ class UnifiedProcessor:
         widths = {
             'A': 38, 'B': 12, 'C': 12, 'D': 12, 'E': 16, 'F': 16,
             'G': 24, 'H': 14, 'I': 18, 'J': 16, 'K': 20,
-            'L': 10, 'M': 10, 'N': 10, 'O': 10, 'P': 10
+            'L': 24, 'M': 24, 'N': 10, 'O': 10, 'P': 10, 'Q': 10, 'R': 10
         }
 
         for col_letter, width in widths.items():
