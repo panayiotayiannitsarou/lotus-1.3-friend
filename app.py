@@ -301,6 +301,7 @@ def _story_md():
 """
 
 STEP8_MODULE_CANDIDATES = [
+    ROOT / "step8_fixed_final_SECOND_THIRD_CHOICE_PPED.py",
     ROOT / "step8_fixed_final_SECOND_CHOICE_MAX2_PPED.py",
     ROOT / "step8_fixed_final_OPTIONAL_FRIEND_MAX2_PPED.py",
     ROOT / "step8_fixed_final_OPTIONAL_FRIEND.py",
@@ -394,12 +395,19 @@ with colC:
             min_classes = max(2, math.ceil(N/25)) if N else 0
             st.metric("Μαθητές / Ελάχιστα τμήματα", f"{N} / {min_classes}")
             _preview_headers = {str(c).strip().upper() for c in df_preview.columns}
-            if "ΔΕΥΤΕΡΗ_ΕΠΙΛΟΓΗ" in _preview_headers:
-                st.caption("✅ Αναγνωρίστηκε η στήλη ΔΕΥΤΕΡΗ_ΕΠΙΛΟΓΗ.")
+            has_second = "ΔΕΥΤΕΡΗ_ΕΠΙΛΟΓΗ" in _preview_headers
+            has_third = "ΤΡΙΤΗ_ΕΠΙΛΟΓΗ" in _preview_headers
+            if has_second or has_third:
+                found = []
+                if has_second:
+                    found.append("ΔΕΥΤΕΡΗ_ΕΠΙΛΟΓΗ")
+                if has_third:
+                    found.append("ΤΡΙΤΗ_ΕΠΙΛΟΓΗ")
+                st.caption("✅ Αναγνωρίστηκαν: " + ", ".join(found) + ".")
             else:
                 st.caption(
-                    "ℹ️ Δεν υπάρχει στήλη ΔΕΥΤΕΡΗ_ΕΠΙΛΟΓΗ. "
-                    "Η κύρια κατανομή θα εκτελεστεί, αλλά ο Κύκλος 3 κοινωνικής αποκατάστασης δεν θα έχει δηλώσεις να εξετάσει."
+                    "ℹ️ Δεν υπάρχουν οι στήλες ΔΕΥΤΕΡΗ_ΕΠΙΛΟΓΗ/ΤΡΙΤΗ_ΕΠΙΛΟΓΗ. "
+                    "Η κύρια κατανομή θα εκτελεστεί, αλλά ο Κύκλος 3 δεν θα έχει κοινωνικές επιλογές να εξετάσει."
                 )
         except Exception:
             st.caption("Δεν ήταν δυνατή η ανάγνωση για προεπισκόπηση.")
@@ -491,9 +499,9 @@ if st.button("🚀 ΕΚΤΕΛΕΣΗ ΚΑΤΑΝΟΜΗΣ", type="primary", use_con
             # Δεν αλλάζουμε το step7_fixed_final.py εδώ· απλώς προστατεύουμε την τελική επιλογή μέσα στο app.
             df_input_full = pd.read_excel(input_path, sheet_name=0)
             _input_headers = {str(c).strip().upper() for c in df_input_full.columns}
-            if "ΔΕΥΤΕΡΗ_ΕΠΙΛΟΓΗ" not in _input_headers:
+            if not ({"ΔΕΥΤΕΡΗ_ΕΠΙΛΟΓΗ", "ΤΡΙΤΗ_ΕΠΙΛΟΓΗ"} & _input_headers):
                 st.info(
-                    "ℹ️ Η στήλη ΔΕΥΤΕΡΗ_ΕΠΙΛΟΓΗ δεν βρέθηκε. "
+                    "ℹ️ Δεν βρέθηκαν οι στήλες ΔΕΥΤΕΡΗ_ΕΠΙΛΟΓΗ/ΤΡΙΤΗ_ΕΠΙΛΟΓΗ. "
                     "Τα Βήματα 1–7 θα εκτελεστούν κανονικά και το Βήμα 8 θα παραλείψει ουσιαστικά τον Κύκλο 3."
                 )
             conflict_data = cg.extract_conflict_data(df_input_full, warn_if_missing_col=True, warn_unresolved=True)
@@ -1020,6 +1028,10 @@ if xl is not None:
                 "ΔΕΥΤΕΡΗ_ΕΠΙΛΟΓΗ:",
                 "✅ διαθέσιμη" if "ΔΕΥΤΕΡΗ_ΕΠΙΛΟΓΗ" in used_df.columns else "— δεν δηλώθηκε",
             )
+            st.write(
+                "ΤΡΙΤΗ_ΕΠΙΛΟΓΗ:",
+                "✅ διαθέσιμη" if "ΤΡΙΤΗ_ΕΠΙΛΟΓΗ" in used_df.columns else "— δεν δηλώθηκε",
+            )
         if missing_cols:
             st.info("Συμπλήρωσε/διόρθωσε τις στήλες που λείπουν στο Excel και ξαναφόρτωσέ το.")
         stats_df = generate_stats(used_df)
@@ -1135,12 +1147,15 @@ if st.session_state.get("last_final_path"):
                             for swap in swaps:
                                 if swap.get("cycle") != 3:
                                     continue
-                                imp = swap.get("improvement", {})
+                                social = swap.get("social_restoration", {})
                                 rows.append({
-                                    "ΚΛΕΙΔΩΜΕΝΟΣ_ΜΑΘΗΤΗΣ": imp.get("locked_student", ""),
-                                    "ΔΕΥΤΕΡΗ_ΕΠΙΛΟΓΗ": imp.get("optional_friend", ""),
-                                    "ΑΠΟ_ΤΜΗΜΑ": swap.get("from_team", ""),
-                                    "ΠΡΟΣ_ΤΜΗΜΑ": swap.get("to_team", ""),
+                                    "ΚΛΕΙΔΩΜΕΝΟΣ_ΜΑΘΗΤΗΣ": social.get("locked_student", ""),
+                                    "ΒΑΣΙΚΟΣ_ΦΙΛΟΣ_ΠΟΥ_ΧΩΡΙΣΤΗΚΕ": social.get("broken_basic_friend", ""),
+                                    "ΕΠΙΛΟΓΗ_ΠΟΥ_ΧΡΗΣΙΜΟΠΟΙΗΘΗΚΕ": social.get("optional_friend", ""),
+                                    "ΣΤΗΛΗ_ΠΡΟΕΛΕΥΣΗΣ": social.get("choice_column", ""),
+                                    "ΠΡΟΤΕΡΑΙΟΤΗΤΑ": social.get("optional_priority", ""),
+                                    "ΤΜΗΜΑ_ΚΛΕΙΔΩΜΕΝΟΥ_ΜΑΘΗΤΗ": swap.get("from_team", ""),
+                                    "ΑΡΧΙΚΟ_ΤΜΗΜΑ_ΕΠΙΛΟΓΗΣ": swap.get("to_team", ""),
                                     "ΤΥΠΟΣ": swap.get("type", ""),
                                 })
                             if rows:

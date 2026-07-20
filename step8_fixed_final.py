@@ -147,27 +147,32 @@ class UnifiedProcessor:
                 friends_str = self._get_cell_value(sheet, row_idx, headers.get('ΦΙΛΟΙ'))
                 friends = _split_name_list(friends_str)
 
-                # Προαιρετικοί φίλοι: έως 2 ονόματα με σειρά προτεραιότητας.
-                # 1ο όνομα = πρώτη επιλογή, 2ο όνομα = εναλλακτική επιλογή.
-                optional_friend = ""
-                for variant in [
-                    'ΔΕΥΤΕΡΗ_ΕΠΙΛΟΓΗ', 'ΔΕΥΤΕΡΗ ΕΠΙΛΟΓΗ',
-                    'ΠΡΟΑΙΡΕΤΙΚΟΣ_ΦΙΛΟΣ', 'ΠΡΟΑΙΡΕΤΙΚΟΣ ΦΙΛΟΣ',
-                    'ΦΙΛΟΣ_2', 'ΦΙΛΟΣ 2', 'ΔΕΥΤΕΡΗ_ΕΠΙΛΟΓΗ_ΦΙΛΟΥ'
-                ]:
-                    if variant in headers:
-                        optional_raw = self._get_cell_value(
-                            sheet, row_idx, headers.get(variant), ''
-                        )
-                        optional_names = _split_name_list(optional_raw)
-                        if len(optional_names) > 2:
-                            self.warnings.append(
-                                f"⚠️ Μαθητής {name}: δηλώθηκαν {len(optional_names)} "
-                                "προαιρετικοί φίλοι· θα χρησιμοποιηθούν μόνο οι 2 πρώτοι "
-                                "με τη σειρά που γράφτηκαν."
-                            )
-                        optional_friend = ', '.join(optional_names[:2])
-                        break
+                # Κοινωνικές εναλλακτικές σε δύο χωριστές στήλες.
+                # ΔΕΥΤΕΡΗ_ΕΠΙΛΟΓΗ εξετάζεται πρώτη και ΤΡΙΤΗ_ΕΠΙΛΟΓΗ μόνο αν
+                # η δεύτερη είναι κενή, άγνωστη ή δεν μπορεί να εφαρμοστεί νόμιμα.
+                second_choice = str(self._get_cell_value(
+                    sheet, row_idx, headers.get('ΔΕΥΤΕΡΗ_ΕΠΙΛΟΓΗ'), ''
+                ) or '').strip()
+                third_choice = str(self._get_cell_value(
+                    sheet, row_idx, headers.get('ΤΡΙΤΗ_ΕΠΙΛΟΓΗ'), ''
+                ) or '').strip()
+
+                # Backward compatibility για παλιό αρχείο με δύο ονόματα σε ένα κελί.
+                if not second_choice and not third_choice:
+                    for variant in [
+                        'ΠΡΟΑΙΡΕΤΙΚΟΣ_ΦΙΛΟΣ', 'ΠΡΟΑΙΡΕΤΙΚΟΣ ΦΙΛΟΣ',
+                        'ΦΙΛΟΣ_2', 'ΦΙΛΟΣ 2', 'ΔΕΥΤΕΡΗ_ΕΠΙΛΟΓΗ_ΦΙΛΟΥ'
+                    ]:
+                        if variant in headers:
+                            legacy_raw = self._get_cell_value(sheet, row_idx, headers.get(variant), '')
+                            legacy_names = _split_name_list(legacy_raw)[:2]
+                            second_choice = legacy_names[0] if legacy_names else ''
+                            third_choice = legacy_names[1] if len(legacy_names) > 1 else ''
+                            break
+
+                optional_friend = ', '.join(
+                    choice for choice in [second_choice, third_choice] if choice
+                )
 
                 # Conflicts
                 conflict_str = self._get_cell_value(sheet, row_idx, headers.get('ΣΥΓΚΡΟΥΣΗ'))
@@ -326,8 +331,8 @@ class UnifiedProcessor:
         # sheet να είναι αυτοτελές (self-contained) και το standalone 'optimize'
         # mode να μη χρειάζεται πλέον το αρχικό source file (self.students_data).
         headers = ['ΜΑΘΗΤΗΣ Α', 'ΜΑΘΗΤΗΣ Β', 'ΚΑΤΗΓΟΡΙΑ ΔΥΑΔΑΣ', 'ΕΠΙΔΟΣΗ', 'LOCKED', 'ΤΜΗΜΑ',
-                   'ΦΥΛΟ_Α', 'ΓΝΩΣΗ_Α', 'ΣΥΓΚΡΟΥΣΗ_Α', 'ΔΕΥΤΕΡΗ_ΕΠΙΛΟΓΗ_Α',
-                   'ΦΥΛΟ_Β', 'ΓΝΩΣΗ_Β', 'ΣΥΓΚΡΟΥΣΗ_Β', 'ΔΕΥΤΕΡΗ_ΕΠΙΛΟΓΗ_Β']
+                   'ΦΥΛΟ_Α', 'ΓΝΩΣΗ_Α', 'ΣΥΓΚΡΟΥΣΗ_Α', 'ΔΕΥΤΕΡΗ_ΕΠΙΛΟΓΗ_Α', 'ΤΡΙΤΗ_ΕΠΙΛΟΓΗ_Α',
+                   'ΦΥΛΟ_Β', 'ΓΝΩΣΗ_Β', 'ΣΥΓΚΡΟΥΣΗ_Β', 'ΔΕΥΤΕΡΗ_ΕΠΙΛΟΓΗ_Β', 'ΤΡΙΤΗ_ΕΠΙΛΟΓΗ_Β']
         for col_idx, header in enumerate(headers, start=1):
             cell = cat_sheet.cell(1, col_idx)
             cell.value = header
@@ -389,13 +394,17 @@ class UnifiedProcessor:
                     cat_sheet.cell(row_idx, 7).value = student_a['data'].gender
                     cat_sheet.cell(row_idx, 8).value = student_a['data'].greek_knowledge
                     cat_sheet.cell(row_idx, 9).value = ', '.join(student_a['data'].conflict_names)
-                    cat_sheet.cell(row_idx, 10).value = student_a['data'].optional_friend
-                    cat_sheet.cell(row_idx, 11).value = student_b['data'].gender
-                    cat_sheet.cell(row_idx, 12).value = student_b['data'].greek_knowledge
-                    cat_sheet.cell(row_idx, 13).value = ', '.join(student_b['data'].conflict_names)
-                    cat_sheet.cell(row_idx, 14).value = student_b['data'].optional_friend
+                    choices_a = _split_name_list(student_a['data'].optional_friend)[:2]
+                    cat_sheet.cell(row_idx, 10).value = choices_a[0] if choices_a else ''
+                    cat_sheet.cell(row_idx, 11).value = choices_a[1] if len(choices_a) > 1 else ''
+                    cat_sheet.cell(row_idx, 12).value = student_b['data'].gender
+                    cat_sheet.cell(row_idx, 13).value = student_b['data'].greek_knowledge
+                    cat_sheet.cell(row_idx, 14).value = ', '.join(student_b['data'].conflict_names)
+                    choices_b = _split_name_list(student_b['data'].optional_friend)[:2]
+                    cat_sheet.cell(row_idx, 15).value = choices_b[0] if choices_b else ''
+                    cat_sheet.cell(row_idx, 16).value = choices_b[1] if len(choices_b) > 1 else ''
 
-                    for col in range(1, 15):
+                    for col in range(1, 17):
                         cat_sheet.cell(row_idx, col).alignment = Alignment(
                             horizontal='left' if col <= 2 else 'center',
                             vertical='center'
@@ -462,7 +471,7 @@ class UnifiedProcessor:
         # FIX: προστέθηκε στήλη ΣΥΓΚΡΟΥΣΗ ώστε το SINGLE sheet να είναι επίσης
         # αυτοτελές (self-contained) όπως το ΚΑΤΗΓΟΡΙΟΠΟΙΗΣΗ.
         headers = ['ΟΝΟΜΑ', 'ΦΥΛΟ', 'ΚΑΛΗ_ΓΝΩΣΗ_ΕΛΛΗΝΙΚΩΝ', 'ΕΠΙΔΟΣΗ', 'ΚΑΤΗΓΟΡΙΑ SINGLE',
-                   'ΤΜΗΜΑ', 'LOCKED', 'ΣΥΓΚΡΟΥΣΗ', 'ΔΕΥΤΕΡΗ_ΕΠΙΛΟΓΗ']
+                   'ΤΜΗΜΑ', 'LOCKED', 'ΣΥΓΚΡΟΥΣΗ', 'ΔΕΥΤΕΡΗ_ΕΠΙΛΟΓΗ', 'ΤΡΙΤΗ_ΕΠΙΛΟΓΗ']
         for col_idx, header in enumerate(headers, start=1):
             cell = single_sheet.cell(1, col_idx)
             cell.value = header
@@ -496,9 +505,11 @@ class UnifiedProcessor:
                 single_sheet.cell(row_idx, 6).value = team_name
 
             single_sheet.cell(row_idx, 8).value = ', '.join(student_data.conflict_names)
-            single_sheet.cell(row_idx, 9).value = student_data.optional_friend
+            single_choices = _split_name_list(student_data.optional_friend)[:2]
+            single_sheet.cell(row_idx, 9).value = single_choices[0] if single_choices else ''
+            single_sheet.cell(row_idx, 10).value = single_choices[1] if len(single_choices) > 1 else ''
 
-            for col in range(1, 10):
+            for col in range(1, 11):
                 single_sheet.cell(row_idx, col).alignment = Alignment(
                     horizontal='left' if col == 1 else 'center',
                     vertical='center'
@@ -657,8 +668,12 @@ class UnifiedProcessor:
                 conflicts_b_raw = self._get_cell_value(sheet, row_idx, headers.get('ΣΥΓΚΡΟΥΣΗΒ'))
                 conflicts_a = _split_name_list(conflicts_a_raw)
                 conflicts_b = _split_name_list(conflicts_b_raw)
-                optional_a = str(self._get_cell_value(sheet, row_idx, headers.get('ΔΕΥΤΕΡΗΕΠΙΛΟΓΗΑ'), '') or '').strip()
-                optional_b = str(self._get_cell_value(sheet, row_idx, headers.get('ΔΕΥΤΕΡΗΕΠΙΛΟΓΗΒ'), '') or '').strip()
+                second_a = str(self._get_cell_value(sheet, row_idx, headers.get('ΔΕΥΤΕΡΗΕΠΙΛΟΓΗΑ'), '') or '').strip()
+                third_a = str(self._get_cell_value(sheet, row_idx, headers.get('ΤΡΙΤΗΕΠΙΛΟΓΗΑ'), '') or '').strip()
+                second_b = str(self._get_cell_value(sheet, row_idx, headers.get('ΔΕΥΤΕΡΗΕΠΙΛΟΓΗΒ'), '') or '').strip()
+                third_b = str(self._get_cell_value(sheet, row_idx, headers.get('ΤΡΙΤΗΕΠΙΛΟΓΗΒ'), '') or '').strip()
+                optional_a = ', '.join(x for x in [second_a, third_a] if x)
+                optional_b = ', '.join(x for x in [second_b, third_b] if x)
                 locked_val = self._get_cell_value(sheet, row_idx, headers.get('LOCKED'))
                 is_locked = (locked_val == 'LOCKED')
             else:
@@ -762,16 +777,11 @@ class UnifiedProcessor:
                     if name in self.students_data else []
                 )
 
-            optional_col = headers.get('ΔΕΥΤΕΡΗΕΠΙΛΟΓΗ')
-            optional_names = _split_name_list(
-                self._get_cell_value(sheet, row_idx, optional_col, '')
-            )
-            if len(optional_names) > 2:
-                self.warnings.append(
-                    f"⚠️ Μαθητής {name}: βρέθηκαν πάνω από 2 προαιρετικοί φίλοι "
-                    "στο SINGLE· θα χρησιμοποιηθούν μόνο οι 2 πρώτοι."
-                )
-            optional_friend = ', '.join(optional_names[:2])
+            second_col = headers.get('ΔΕΥΤΕΡΗΕΠΙΛΟΓΗ')
+            third_col = headers.get('ΤΡΙΤΗΕΠΙΛΟΓΗ')
+            second_choice = str(self._get_cell_value(sheet, row_idx, second_col, '') or '').strip()
+            third_choice = str(self._get_cell_value(sheet, row_idx, third_col, '') or '').strip()
+            optional_friend = ', '.join(x for x in [second_choice, third_choice] if x)
 
             self.students[name] = Student(
                 name=name,
@@ -1186,9 +1196,9 @@ class UnifiedProcessor:
         Κύκλος 3: φέρνει προς τον locked μαθητή τον πρώτο νόμιμο
         προαιρετικό φίλο, ποτέ τον locked μαθητή προς τον φίλο.
 
-        Η στήλη ΔΕΥΤΕΡΗ_ΕΠΙΛΟΓΗ δέχεται έως 2 ονόματα με σειρά
-        προτεραιότητας. Το δεύτερο εξετάζεται μόνο όταν το πρώτο δεν μπορεί
-        να μετακινηθεί νόμιμα.
+        Οι στήλες ΔΕΥΤΕΡΗ_ΕΠΙΛΟΓΗ και ΤΡΙΤΗ_ΕΠΙΛΟΓΗ δέχονται από ένα όνομα.
+        Η ΤΡΙΤΗ_ΕΠΙΛΟΓΗ εξετάζεται μόνο όταν η ΔΕΥΤΕΡΗ_ΕΠΙΛΟΓΗ δεν μπορεί
+        να εφαρμοστεί νόμιμα.
         """
         applied: List[Dict] = []
         targets = self._locked_students_with_broken_mutual_friendship()
@@ -1213,7 +1223,7 @@ class UnifiedProcessor:
                 )
                 if not optional_name:
                     self.warnings.append(
-                        f"⚠️ {locked_name}: ο δεύτερη επιλογή επιλογής "
+                        f"⚠️ {locked_name}: η κοινωνική επιλογή "
                         f"{choice_index} ({optional_ref}) δεν βρέθηκε στους μαθητές."
                     )
                     continue
@@ -1225,7 +1235,7 @@ class UnifiedProcessor:
                 # Ήδη μαζί: η κοινωνική υποστήριξη υπάρχει χωρίς μετακίνηση.
                 if optional_team == locked_team:
                     print(
-                        f"   ✅ {locked_name}: ο δεύτερη επιλογή επιλογής "
+                        f"   ✅ {locked_name}: η κοινωνική επιλογή "
                         f"{choice_index} ({optional_name}) βρίσκεται ήδη στο {locked_team}."
                     )
                     restored = True
@@ -1276,6 +1286,7 @@ class UnifiedProcessor:
                             'broken_basic_friend': target['basic_friend'],
                             'optional_friend': optional_name,
                             'optional_priority': choice_index,
+                            'choice_column': 'ΔΕΥΤΕΡΗ_ΕΠΙΛΟΓΗ' if choice_index == 1 else 'ΤΡΙΤΗ_ΕΠΙΛΟΓΗ',
                             'optional_group': names_in,
                         },
                         'improvement': {
@@ -1798,6 +1809,7 @@ class UnifiedProcessor:
             'ΕΠΙΔΟΣΗ',
             'ΦΙΛΟΙ',
             'ΔΕΥΤΕΡΗ_ΕΠΙΛΟΓΗ',
+            'ΤΡΙΤΗ_ΕΠΙΛΟΓΗ',
             'ΠΑΙΔΙ_ΕΚΠΑΙΔΕΥΤΙΚΟΥ',
             'ΖΩΗΡΟΣ',
             'ΙΔΙΑΙΤΕΡΟΤΗΤΑ',
@@ -1830,13 +1842,15 @@ class UnifiedProcessor:
             sheet.cell(row_idx, 3).value = greek_val
             sheet.cell(row_idx, 4).value = student.choice
             sheet.cell(row_idx, 5).value = ', '.join(student.friends)
-            sheet.cell(row_idx, 6).value = student.optional_friend
-            sheet.cell(row_idx, 7).value = source_student.teacher_child if source_student else 'Ο'
-            sheet.cell(row_idx, 8).value = source_student.calm if source_student else 'Ο'
-            sheet.cell(row_idx, 9).value = source_student.special_needs if source_student else 'Ο'
-            sheet.cell(row_idx, 10).value = ', '.join(student.conflict_names)
+            team_choices = _split_name_list(student.optional_friend)[:2]
+            sheet.cell(row_idx, 6).value = team_choices[0] if team_choices else ''
+            sheet.cell(row_idx, 7).value = team_choices[1] if len(team_choices) > 1 else ''
+            sheet.cell(row_idx, 8).value = source_student.teacher_child if source_student else 'Ο'
+            sheet.cell(row_idx, 9).value = source_student.calm if source_student else 'Ο'
+            sheet.cell(row_idx, 10).value = source_student.special_needs if source_student else 'Ο'
+            sheet.cell(row_idx, 11).value = ', '.join(student.conflict_names)
 
-            for col in range(1, 11):
+            for col in range(1, 12):
                 sheet.cell(row_idx, col).alignment = Alignment(
                     horizontal='left' if col in [1, 5, 6, 10] else 'center',
                     vertical='center',
