@@ -1,0 +1,2205 @@
+"""
+step8_fixed_final.py
+====================
+Ολοκληρωμένο module για Fill + Optimize (χωρίς Streamlit UI).
+
+Παρέχει όλη τη λειτουργικότητα του app.py ως library/CLI:
+- Phase 1: Fill template με δεδομένα μαθητών
+- Phase 2: Optimization με asymmetric swaps
+- Locked students support (ΖΩΗΡΟΣ, ΠΑΙΔΙ_ΕΚΠΑΙΔΕΥΤΙΚΟΥ, ΙΔΙΑΙΤΕΡΟΤΗΤΑ)
+- ΚΑΤΗΓΟΡΙΟΠΟΙΗΣΗ + SINGLE sheets
+- Detailed statistics + swaps log
+
+Απαιτήσεις: openpyxl>=3.1.0
+"""
+from __future__ import annotations
+
+import sys
+import re
+import unicodedata
+import argparse
+from pathlib import Path
+from dataclasses import dataclass, field
+from typing import Dict, List, Tuple, Optional, Any
+
+from openpyxl import load_workbook, Workbook
+from openpyxl.styles import Alignment, PatternFill, Font
+from openpyxl.worksheet.worksheet import Worksheet
+
+
+# ========== DATACLASSES (FIXED για Python 3.12) ==========
+
+@dataclass
+class StudentData:
+    """Δεδομένα μαθητή από source (Phase 1)."""
+    name: str = ""
+    gender: str = ""
+    teacher_child: str = "Ο"
+    calm: str = "Ο"
+    special_needs: str = "Ο"
+    greek_knowledge: str = "Ν"
+    friends: List[str] = field(default_factory=list)
+    optional_friend: str = ""
+    conflict_names: List[str] = field(default_factory=list)  # δηλωμένες συγκρούσεις
+    choice: int = 1
+
+
+@dataclass
+class Student:
+    """Student για optimizer (Phase 2)."""
+    name: str = ""
+    choice: int = 1
+    gender: str = ""
+    greek_knowledge: str = "Ν"
+    friends: List[str] = field(default_factory=list)
+    optional_friend: str = ""
+    conflict_names: List[str] = field(default_factory=list)  # δηλωμένες συγκρούσεις
+    locked: bool = False
+
+
+class LegacyExcelFormatError(ValueError):
+    """Το input Excel δεν περιέχει τις νέες raw στήλες (ΦΥΛΟ_Α/Β, ΓΝΩΣΗ_Α/Β,
+    ΣΥΓΚΡΟΥΣΗ_Α/Β, ΣΥΓΚΡΟΥΣΗ) που παράγει το τρέχον 'fill' mode.
+
+    Σηκώνεται fail-fast από το load_filled_data ώστε να ΜΗΝ τρέξει
+    optimization πάνω σε σιωπηλά ελλιπή δεδομένα (default gender='Α',
+    greek='Ν', καμία σύγκρουση). Αν το legacy fallback είναι επιθυμητό,
+    πέρασε ρητά allow_legacy_fallback=True.
+    """
+
+
+
+
+# ========== SHARED NAME HELPERS ==========
+
+def _strip_diacritics(text: str) -> str:
+    nfkd = unicodedata.normalize("NFD", str(text))
+    return "".join(ch for ch in nfkd if not unicodedata.combining(ch))
+
+
+def _canon_name(x: Any) -> str:
+    """Ενιαία κανονικοποίηση ονομάτων για φίλους/συγκρούσεις."""
+    if x is None:
+        return ""
+    s = str(x).strip().strip("[]'\" ")
+    s = re.sub(r"\s+", " ", s)
+    return _strip_diacritics(s).upper()
+
+
+def _split_name_list(value: Any) -> List[str]:
+    """Ασφαλές split λίστας ονομάτων από Excel cell."""
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        raw = list(value)
+    else:
+        s = str(value).strip()
+        if not s or s.upper() in {"NAN", "NONE", "NULL", "-"}:
+            return []
+        raw = re.split(r"[,;|/·\n]+", s)
+    return [str(x).strip() for x in raw if str(x).strip()]
+
+
+def _name_in_list(target: str, names: List[str]) -> bool:
+    target_c = _canon_name(target)
+    return bool(target_c) and target_c in {_canon_name(n) for n in names}
+
+
+def _are_mutual_friends(name_a: str, friends_a: List[str], name_b: str, friends_b: List[str]) -> bool:
+    """True μόνο για πλήρως αμοιβαία δυάδα."""
+    return _name_in_list(name_b, friends_a) and _name_in_list(name_a, friends_b)
+
+# ========== MAIN PROCESSOR CLASS ==========
+
+class UnifiedProcessor:
+    """Ενοποιημένος processor: Fill + Optimize."""
+    
+    def __init__(self):
+        self.students_data: Dict[str, StudentData] = {}
+        self.teams_students: Dict[str, List[str]] = {}
+        self.students: Dict[str, Student] = {}
+        self.teams: Dict[str, List[str]] = {}
+        self.target_ep3 = 3
+        self.target_gender = 4
+        self.target_greek = 4
+        self.warnings: List[str] = []
+    
+    # ==================== PHASE 1: FILL ====================
+    
+    def read_source_data(self, source_path: str) -> None:
+        """Διάβασμα δεδομένων από Παράδειγμα1.xlsx."""
+        wb = load_workbook(source_path, data_only=True)
+        
+        for sheet_name in wb.sheetnames:
+            sheet = wb[sheet_name]
+            headers = self._parse_headers_fill(sheet)
+            
+            if 'ΟΝΟΜΑ' not in headers:
+                continue
+            
+            for row_idx in range(2, sheet.max_row + 1):
+                name = self._get_cell_value(sheet, row_idx, headers.get('ΟΝΟΜΑ'))
+                
+                if not name:
+                    continue
+                
+                # Friends
+                friends_str = self._get_cell_value(sheet, row_idx, headers.get('ΦΙΛΟΙ'))
+                friends = _split_name_list(friends_str)
+
+                # Προαιρετικοί φίλοι: έως 2 ονόματα με σειρά προτεραιότητας.
+                # 1ο όνομα = πρώτη επιλογή, 2ο όνομα = εναλλακτική επιλογή.
+                optional_friend = ""
+                for variant in [
+                    'ΠΡΟΑΙΡΕΤΙΚΟΣ_ΦΙΛΟΣ', 'ΠΡΟΑΙΡΕΤΙΚΟΣ ΦΙΛΟΣ',
+                    'ΦΙΛΟΣ_2', 'ΦΙΛΟΣ 2', 'ΔΕΥΤΕΡΗ_ΕΠΙΛΟΓΗ_ΦΙΛΟΥ'
+                ]:
+                    if variant in headers:
+                        optional_raw = self._get_cell_value(
+                            sheet, row_idx, headers.get(variant), ''
+                        )
+                        optional_names = _split_name_list(optional_raw)
+                        if len(optional_names) > 2:
+                            self.warnings.append(
+                                f"⚠️ Μαθητής {name}: δηλώθηκαν {len(optional_names)} "
+                                "προαιρετικοί φίλοι· θα χρησιμοποιηθούν μόνο οι 2 πρώτοι "
+                                "με τη σειρά που γράφτηκαν."
+                            )
+                        optional_friend = ', '.join(optional_names[:2])
+                        break
+
+                # Conflicts
+                conflict_str = self._get_cell_value(sheet, row_idx, headers.get('ΣΥΓΚΡΟΥΣΗ'))
+                conflict_names = _split_name_list(conflict_str)
+                
+                # Choice (ΕΠΙΔΟΣΗ)
+                choice_val = 1
+                if 'ΕΠΙΔΟΣΗ' in headers:
+                    epidosi_raw = sheet.cell(row_idx, headers['ΕΠΙΔΟΣΗ']).value
+                    if epidosi_raw is not None:
+                        try:
+                            choice_val = int(epidosi_raw)
+                        except:
+                            choice_val = 1
+                
+                # Greek knowledge - robust parsing
+                greek_raw = None
+                found_greek = False
+                for variant in ['ΚΑΛΗ_ΓΝΩΣΗ_ΕΛΛΗΝΙΚΩΝ', 'ΚΑΛΗ ΓΝΩΣΗ ΕΛΛΗΝΙΚΩΝ', 
+                               'ΚΑΛΗ_ΓΝΩΣΗ', 'ΓΝΩΣΗ_ΕΛΛΗΝΙΚΩΝ']:
+                    if variant in headers:
+                        greek_raw = self._get_cell_value(sheet, row_idx, headers[variant], None)
+                        if greek_raw is not None and greek_raw != '':
+                            found_greek = True
+                            break
+                
+                # Process Greek knowledge
+                if not found_greek or greek_raw is None or greek_raw == '':
+                    self.warnings.append(f"⚠️ Μαθητής {name}: Δεν βρέθηκε ΚΑΛΗ_ΓΝΩΣΗ_ΕΛΛΗΝΙΚΩΝ - παραλείπεται")
+                    continue
+                else:
+                    greek_str = str(greek_raw).strip().upper()
+                    if greek_str.startswith('Ν') or greek_str.startswith('N'):
+                        greek_val = 'Ν'
+                    elif greek_str.startswith('Ο') or greek_str.startswith('O'):
+                        greek_val = 'Ο'
+                    else:
+                        self.warnings.append(f"⚠️ Unknown ΚΑΛΗ_ΓΝΩΣΗ '{greek_raw}' for {name}, defaulting to Ν")
+                        greek_val = 'Ν'
+                
+                self.students_data[name] = StudentData(
+                    name=name,
+                    gender=self._get_cell_value(sheet, row_idx, headers.get('ΦΥΛΟ'), 'Κ'),
+                    teacher_child=self._get_cell_value(sheet, row_idx, headers.get('ΠΑΙΔΙ_ΕΚΠΑΙΔΕΥΤΙΚΟΥ'), 'Ο'),
+                    calm=self._get_cell_value(sheet, row_idx, headers.get('ΖΩΗΡΟΣ'), 'Ο'),
+                    special_needs=self._get_cell_value(sheet, row_idx, headers.get('ΙΔΙΑΙΤΕΡΟΤΗΤΑ'), 'Ο'),
+                    greek_knowledge=greek_val,
+                    friends=friends,
+                    optional_friend=optional_friend,
+                    conflict_names=conflict_names,
+                    choice=choice_val
+                )
+        
+        wb.close()
+        print(f"✅ Διαβάστηκαν {len(self.students_data)} μαθητές από source file")
+    
+    def fill_target_excel(self, template_path: str, output_path: str) -> str:
+        """Συμπλήρωση STEP7_TEMPLATE."""
+        wb = load_workbook(template_path)
+        
+        for sheet_name in wb.sheetnames:
+            sheet = wb[sheet_name]
+            filled_count = self._fill_sheet(sheet, sheet_name)
+            if filled_count > 0:
+                print(f"📝 Sheet '{sheet_name}': {filled_count} μαθητές")
+        
+        self._create_categorization_sheet(wb)
+        
+        wb.save(output_path)
+        wb.close()
+        
+        print(f"✅ Filled Excel αποθηκεύτηκε: {output_path}")
+        return output_path
+    
+    def _fill_sheet(self, sheet: Worksheet, team_name: str) -> int:
+        """Συμπλήρωση ενός sheet."""
+        headers_map = {}
+        for col_idx, cell in enumerate(sheet[1], start=1):
+            if cell.value:
+                header = str(cell.value).strip().upper()
+                header_key = header.replace('_', '').replace(' ', '')
+                headers_map[header_key] = col_idx
+        
+        if 'ΟΝΟΜΑ' not in headers_map:
+            return 0
+        
+        required_headers = ['ΦΥΛΟ', 'ΚΑΛΗΓΝΩΣΗΕΛΛΗΝΙΚΩΝ', 'ΕΠΙΔΟΣΗ', 'ΦΙΛΟΙ']
+        next_col = max(headers_map.values()) + 1
+        
+        for req_header in required_headers:
+            if req_header not in headers_map:
+                cell = sheet.cell(1, next_col)
+                original_header = req_header.replace('ΚΑΛΗΓΝΩΣΗΕΛΛΗΝΙΚΩΝ', 'ΚΑΛΗ_ΓΝΩΣΗ_ΕΛΛΗΝΙΚΩΝ')
+                cell.value = original_header
+                cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+                cell.font = Font(bold=True)
+                headers_map[req_header] = next_col
+                next_col += 1
+        
+        filled_count = 0
+        
+        if team_name not in self.teams_students:
+            self.teams_students[team_name] = []
+        
+        for row_idx in range(2, sheet.max_row + 1):
+            name_cell = sheet.cell(row_idx, headers_map['ΟΝΟΜΑ'])
+            name = name_cell.value
+            
+            if not name or str(name).strip() == '':
+                continue
+            
+            name = str(name).strip()
+            
+            if name not in self.students_data:
+                continue
+            
+            student_data = self.students_data[name]
+            self.teams_students[team_name].append(name)
+            
+            # Fill ΦΥΛΟ
+            if 'ΦΥΛΟ' in headers_map:
+                col = headers_map['ΦΥΛΟ']
+                sheet.cell(row_idx, col).value = student_data.gender
+                sheet.cell(row_idx, col).alignment = Alignment(horizontal='center', vertical='center')
+            
+            # Fill ΚΑΛΗ_ΓΝΩΣΗ_ΕΛΛΗΝΙΚΩΝ
+            if 'ΚΑΛΗΓΝΩΣΗΕΛΛΗΝΙΚΩΝ' in headers_map:
+                col = headers_map['ΚΑΛΗΓΝΩΣΗΕΛΛΗΝΙΚΩΝ']
+                sheet.cell(row_idx, col).value = student_data.greek_knowledge
+                sheet.cell(row_idx, col).alignment = Alignment(horizontal='center', vertical='center')
+            
+            # Fill ΦΙΛΟΙ
+            if 'ΦΙΛΟΙ' in headers_map:
+                col = headers_map['ΦΙΛΟΙ']
+                sheet.cell(row_idx, col).value = ', '.join(student_data.friends) if student_data.friends else ''
+                sheet.cell(row_idx, col).alignment = Alignment(horizontal='left', vertical='center')
+            
+            # Fill ΕΠΙΔΟΣΗ
+            if 'ΕΠΙΔΟΣΗ' in headers_map:
+                col = headers_map['ΕΠΙΔΟΣΗ']
+                sheet.cell(row_idx, col).value = student_data.choice
+                sheet.cell(row_idx, col).alignment = Alignment(horizontal='center', vertical='center')
+            
+            filled_count += 1
+        
+        return filled_count
+    
+    def _create_categorization_sheet(self, workbook: Workbook) -> None:
+        """Δημιουργία sheet ΚΑΤΗΓΟΡΙΟΠΟΙΗΣΗ."""
+        if 'ΚΑΤΗΓΟΡΙΟΠΟΙΗΣΗ' in workbook.sheetnames:
+            del workbook['ΚΑΤΗΓΟΡΙΟΠΟΙΗΣΗ']
+        
+        cat_sheet = workbook.create_sheet('ΚΑΤΗΓΟΡΙΟΠΟΙΗΣΗ')
+
+        # FIX: προστέθηκαν raw στήλες (ΦΥΛΟ/ΓΝΩΣΗ/ΣΥΓΚΡΟΥΣΗ ανά μαθητή) ώστε το
+        # sheet να είναι αυτοτελές (self-contained) και το standalone 'optimize'
+        # mode να μη χρειάζεται πλέον το αρχικό source file (self.students_data).
+        headers = ['ΜΑΘΗΤΗΣ Α', 'ΜΑΘΗΤΗΣ Β', 'ΚΑΤΗΓΟΡΙΑ ΔΥΑΔΑΣ', 'ΕΠΙΔΟΣΗ', 'LOCKED', 'ΤΜΗΜΑ',
+                   'ΦΥΛΟ_Α', 'ΓΝΩΣΗ_Α', 'ΣΥΓΚΡΟΥΣΗ_Α', 'ΠΡΟΑΙΡΕΤΙΚΟΣ_ΦΙΛΟΣ_Α',
+                   'ΦΥΛΟ_Β', 'ΓΝΩΣΗ_Β', 'ΣΥΓΚΡΟΥΣΗ_Β', 'ΠΡΟΑΙΡΕΤΙΚΟΣ_ΦΙΛΟΣ_Β']
+        for col_idx, header in enumerate(headers, start=1):
+            cell = cat_sheet.cell(1, col_idx)
+            cell.value = header
+            cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+        
+        all_students = []
+        for team_name in sorted(self.teams_students.keys()):
+            for student_name in self.teams_students[team_name]:
+                if student_name in self.students_data:
+                    student = self.students_data[student_name]
+                    all_students.append({
+                        'name': student_name,
+                        'data': student,
+                        'team': team_name
+                    })
+        
+        row_idx = 2
+        processed = set()
+        
+        for i, student_a in enumerate(all_students):
+            if student_a['name'] in processed:
+                continue
+            
+            for j, student_b in enumerate(all_students[i+1:], start=i+1):
+                if student_b['name'] in processed:
+                    continue
+                
+                if _are_mutual_friends(
+                    student_a['name'], student_a['data'].friends,
+                    student_b['name'], student_b['data'].friends
+                ):
+                    
+                    category = self._determine_category(
+                        student_a['data'].gender,
+                        student_a['data'].greek_knowledge,
+                        student_b['data'].gender,
+                        student_b['data'].greek_knowledge
+                    )
+                    
+                    epidosi_text = f"{student_a['data'].choice}, {student_b['data'].choice}"
+                    
+                    cat_sheet.cell(row_idx, 1).value = student_a['name']
+                    cat_sheet.cell(row_idx, 2).value = student_b['name']
+                    cat_sheet.cell(row_idx, 3).value = category
+                    cat_sheet.cell(row_idx, 4).value = epidosi_text
+                    
+                    is_locked = (self._is_student_locked(student_a['data']) or 
+                                 self._is_student_locked(student_b['data']))
+                    cat_sheet.cell(row_idx, 5).value = 'LOCKED' if is_locked else 'ΟΧΙ'
+                    
+                    if is_locked:
+                        team_text = 'LOCKED'
+                    else:
+                        team_text = f"{student_a['team']},{student_b['team']}"
+                    cat_sheet.cell(row_idx, 6).value = team_text
+
+                    # FIX: γράφουμε raw δεδομένα ώστε να ξαναδιαβάζονται 1-προς-1
+                    # στο load_filled_data χωρίς εξάρτηση από self.students_data.
+                    cat_sheet.cell(row_idx, 7).value = student_a['data'].gender
+                    cat_sheet.cell(row_idx, 8).value = student_a['data'].greek_knowledge
+                    cat_sheet.cell(row_idx, 9).value = ', '.join(student_a['data'].conflict_names)
+                    cat_sheet.cell(row_idx, 10).value = student_a['data'].optional_friend
+                    cat_sheet.cell(row_idx, 11).value = student_b['data'].gender
+                    cat_sheet.cell(row_idx, 12).value = student_b['data'].greek_knowledge
+                    cat_sheet.cell(row_idx, 13).value = ', '.join(student_b['data'].conflict_names)
+                    cat_sheet.cell(row_idx, 14).value = student_b['data'].optional_friend
+
+                    for col in range(1, 15):
+                        cat_sheet.cell(row_idx, col).alignment = Alignment(
+                            horizontal='left' if col <= 2 else 'center',
+                            vertical='center'
+                        )
+                    
+                    processed.add(student_a['name'])
+                    processed.add(student_b['name'])
+                    row_idx += 1
+                    break
+        
+        cat_sheet.column_dimensions['A'].width = 30
+        cat_sheet.column_dimensions['B'].width = 30
+        cat_sheet.column_dimensions['C'].width = 35
+        cat_sheet.column_dimensions['D'].width = 12
+        cat_sheet.column_dimensions['E'].width = 12
+        cat_sheet.column_dimensions['F'].width = 20
+        for col in ['G', 'H', 'I', 'J', 'K', 'L', 'M', 'N']:
+            cat_sheet.column_dimensions[col].width = 18
+
+        self._create_single_sheet(workbook, all_students, processed)
+    
+    def _is_student_locked(self, student: StudentData) -> bool:
+        """Κλειδώνει Ν1 και Ν, καθώς και παιδιά εκπαιδευτικών/ιδιαιτερότητες."""
+        behavior = str(student.calm).strip().upper()
+        teacher_child = str(student.teacher_child).strip().upper()
+        special_needs = str(student.special_needs).strip().upper()
+        return (
+            behavior in {"Ν1", "Ν"}
+            or teacher_child == "Ν"
+            or special_needs == "Ν"
+        )
+    
+    def _determine_category(self, gender_a: str, greek_a: str, gender_b: str, greek_b: str) -> str:
+        """Καθορισμός κατηγορίας δυάδας."""
+        if gender_a != gender_b:
+            return "Ομάδες Μικτού Φύλου"
+        
+        gender_label = "Κορίτσια" if gender_a == "Κ" else "Αγόρια"
+        
+        if greek_a == greek_b:
+            if greek_a == "Ν":
+                return f"Καλή Γνώση ({gender_label})"
+            else:
+                return f"όχι Καλή Γνώση ({gender_label})"
+        else:
+            return f"Μικτής Γνώσης ({gender_label})"
+    
+    def _determine_single_category(self, gender: str, greek_knowledge: str) -> str:
+        """Καθορισμός κατηγορίας για μεμονωμένο μαθητή."""
+        gender_label = "Κορίτσια" if gender == "Κ" else "Αγόρια"
+        
+        if greek_knowledge == "Ν":
+            return f"{gender_label} - Ν (Καλή γνώση)"
+        else:
+            return f"{gender_label} - Ο (όχι καλή γνώση)"
+    
+    def _create_single_sheet(self, workbook: Workbook, all_students: List[Dict], processed_names: set) -> None:
+        """Δημιουργία sheet SINGLE."""
+        if 'SINGLE' in workbook.sheetnames:
+            del workbook['SINGLE']
+        
+        single_sheet = workbook.create_sheet('SINGLE')
+        
+        # FIX: προστέθηκε στήλη ΣΥΓΚΡΟΥΣΗ ώστε το SINGLE sheet να είναι επίσης
+        # αυτοτελές (self-contained) όπως το ΚΑΤΗΓΟΡΙΟΠΟΙΗΣΗ.
+        headers = ['ΟΝΟΜΑ', 'ΦΥΛΟ', 'ΚΑΛΗ_ΓΝΩΣΗ_ΕΛΛΗΝΙΚΩΝ', 'ΕΠΙΔΟΣΗ', 'ΚΑΤΗΓΟΡΙΑ SINGLE',
+                   'ΤΜΗΜΑ', 'LOCKED', 'ΣΥΓΚΡΟΥΣΗ', 'ΠΡΟΑΙΡΕΤΙΚΟΣ_ΦΙΛΟΣ']
+        for col_idx, header in enumerate(headers, start=1):
+            cell = single_sheet.cell(1, col_idx)
+            cell.value = header
+            cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+        
+        single_students = []
+        for student in all_students:
+            if student['name'] not in processed_names:
+                single_students.append(student)
+        
+        single_students.sort(key=lambda x: x['name'])
+        
+        for row_idx, student in enumerate(single_students, start=2):
+            student_data = student['data']
+            team_name = student['team']
+            
+            single_sheet.cell(row_idx, 1).value = student['name']
+            single_sheet.cell(row_idx, 2).value = student_data.gender
+            single_sheet.cell(row_idx, 3).value = student_data.greek_knowledge
+            single_sheet.cell(row_idx, 4).value = student_data.choice
+            
+            category = self._determine_single_category(student_data.gender, student_data.greek_knowledge)
+            single_sheet.cell(row_idx, 5).value = category
+            
+            is_locked = self._is_student_locked(student_data)
+            single_sheet.cell(row_idx, 7).value = 'LOCKED' if is_locked else 'ΟΧΙ'
+            
+            if is_locked:
+                single_sheet.cell(row_idx, 6).value = 'LOCKED'
+            else:
+                single_sheet.cell(row_idx, 6).value = team_name
+
+            single_sheet.cell(row_idx, 8).value = ', '.join(student_data.conflict_names)
+            single_sheet.cell(row_idx, 9).value = student_data.optional_friend
+
+            for col in range(1, 10):
+                single_sheet.cell(row_idx, col).alignment = Alignment(
+                    horizontal='left' if col == 1 else 'center',
+                    vertical='center'
+                )
+        
+        single_sheet.column_dimensions['A'].width = 30
+        single_sheet.column_dimensions['B'].width = 12
+        single_sheet.column_dimensions['C'].width = 25
+        single_sheet.column_dimensions['D'].width = 12
+        single_sheet.column_dimensions['E'].width = 35
+        single_sheet.column_dimensions['F'].width = 20
+        single_sheet.column_dimensions['G'].width = 12
+        single_sheet.column_dimensions['H'].width = 25
+        single_sheet.column_dimensions['I'].width = 30
+    
+    # ==================== PHASE 2: OPTIMIZE ====================
+    
+    def load_filled_data(self, filled_path: str, allow_legacy_fallback: bool = False) -> None:
+        """Φόρτωση δεδομένων από filled Excel για optimization.
+
+        Args:
+            filled_path: Path στο filled Excel (output του 'fill' mode).
+            allow_legacy_fallback: Αν False (default), σηκώνει
+                ``LegacyExcelFormatError`` fail-fast όταν λείπουν οι νέες raw
+                στήλες, αντί να κάνει σιωπηλό fallback σε defaults. Πέρασέ το
+                True μόνο αν αποδέχεσαι ρητά ελλιπή δεδομένα φύλου/γνώσης/
+                συγκρούσεων για παλιά αρχεία.
+
+        Raises:
+            LegacyExcelFormatError: αν λείπουν οι νέες στήλες και
+                allow_legacy_fallback είναι False.
+        """
+        wb = load_workbook(filled_path, data_only=True)
+
+        self._validate_new_schema(wb, allow_legacy_fallback)
+
+        if 'ΚΑΤΗΓΟΡΙΟΠΟΙΗΣΗ' in wb.sheetnames:
+            self._load_from_kategoriopoihsh(wb['ΚΑΤΗΓΟΡΙΟΠΟΙΗΣΗ'])
+        
+        if 'SINGLE' in wb.sheetnames:
+            self._load_from_single(wb['SINGLE'])
+        
+        for sheet_name in wb.sheetnames:
+            if sheet_name in ['ΚΑΤΗΓΟΡΙΟΠΟΙΗΣΗ', 'SINGLE']:
+                continue
+            
+            sheet = wb[sheet_name]
+            headers = self._parse_headers(sheet)
+            
+            if 'ΟΝΟΜΑ' not in headers:
+                continue
+            
+            self.teams[sheet_name] = []
+            
+            for row_idx in range(2, sheet.max_row + 1):
+                name = self._get_cell_value(sheet, row_idx, headers.get('ΟΝΟΜΑ'))
+                if name and name in self.students:
+                    self.teams[sheet_name].append(name)
+        
+        wb.close()
+        print(f"✅ Φορτώθηκαν {len(self.students)} students, {len(self.teams)} teams")
+    
+    def _validate_new_schema(self, wb: Workbook, allow_legacy_fallback: bool) -> None:
+        """Ελέγχει ρητά (fail-fast) το σχήμα στηλών πριν τρέξει οποιαδήποτε
+        λογική optimization. Αντικαθιστά το προηγούμενο 'σιωπηλό warning +
+        fallback': τώρα, αν λείπουν οι νέες στήλες, σταματάει αμέσως με σαφές
+        μήνυμα, εκτός αν το caller περάσει ρητά allow_legacy_fallback=True.
+        """
+        problems: List[str] = []
+
+        if 'ΚΑΤΗΓΟΡΙΟΠΟΙΗΣΗ' in wb.sheetnames:
+            headers = self._parse_headers(wb['ΚΑΤΗΓΟΡΙΟΠΟΙΗΣΗ'])
+            required_new = ['ΦΥΛΟΑ', 'ΓΝΩΣΗΑ', 'ΦΥΛΟΒ', 'ΓΝΩΣΗΒ']
+            missing = [h for h in required_new if h not in headers]
+            if missing:
+                problems.append(f"ΚΑΤΗΓΟΡΙΟΠΟΙΗΣΗ: λείπουν στήλες {missing}")
+
+        if 'SINGLE' in wb.sheetnames:
+            headers = self._parse_headers(wb['SINGLE'])
+            if 'ΣΥΓΚΡΟΥΣΗ' not in headers:
+                problems.append("SINGLE: λείπει στήλη ΣΥΓΚΡΟΥΣΗ")
+
+        if not problems:
+            return
+
+        message = (
+            "Το input Excel φαίνεται να έχει παραχθεί από ΠΑΛΙΟ 'fill' mode "
+            "(λείπουν νέες στήλες φύλου/γνώσης/σύγκρουσης): "
+            + "; ".join(problems)
+            + ". Ξανάτρεξε το mode 'fill' στο σωστό source για πλήρη "
+              "δεδομένα, ή πέρασε ρητά allow_legacy_fallback=True "
+              "(CLI: --allow-legacy-fallback) αν αποδέχεσαι ελλιπή δεδομένα "
+              "(defaults: gender='Α', greek='Ν', καμία σύγκρουση)."
+        )
+
+        if allow_legacy_fallback:
+            self.warnings.append(f"⚠️ {message}")
+        else:
+            raise LegacyExcelFormatError(message)
+
+    def _load_from_kategoriopoihsh(self, sheet: Worksheet) -> None:
+        """Διάβασμα δυάδων από ΚΑΤΗΓΟΡΙΟΠΟΙΗΣΗ sheet.
+
+        FIX: πριν, το φύλο/γνώση/συγκρούσεις διαβάζονταν από
+        ``self.students_data`` (in-memory cache που γεμίζει μόνο η
+        ``read_source_data``). Στο standalone CLI mode ``optimize`` η cache
+        αυτή είναι πάντα άδεια, οπότε ΟΛΟΙ οι μαθητές έπαιρναν σιωπηλά τις
+        default τιμές ('Α', 'Ν', χωρίς locked/conflicts) — λάθος αποτελέσματα
+        χωρίς κανένα σφάλμα/warning. Τώρα διαβάζουμε πρώτα τις raw στήλες
+        ΦΥΛΟ_Α/ΓΝΩΣΗ_Α/ΣΥΓΚΡΟΥΣΗ_Α (Β αντίστοιχα) που γράφει η
+        ``_create_categorization_sheet``· αν λείπουν (παλιό αρχείο χωρίς τις
+        στήλες αυτές), γίνεται fallback σε ``self.students_data`` με warning.
+        """
+        headers = self._parse_headers(sheet)
+        
+        required = ['ΜΑΘΗΤΗΣΑ', 'ΜΑΘΗΤΗΣΒ', 'ΚΑΤΗΓΟΡΙΑΔΥΑΔΑΣ', 'ΕΠΙΔΟΣΗ']
+        missing = [h for h in required if h not in headers]
+        if missing:
+            return
+
+        has_raw_cols = all(
+            h in headers for h in ['ΦΥΛΟΑ', 'ΓΝΩΣΗΑ', 'ΦΥΛΟΒ', 'ΓΝΩΣΗΒ']
+        )
+        if not has_raw_cols:
+            self.warnings.append(
+                "⚠️ ΚΑΤΗΓΟΡΙΟΠΟΙΗΣΗ: λείπουν οι στήλες ΦΥΛΟ_Α/ΓΝΩΣΗ_Α/ΦΥΛΟ_Β/"
+                "ΓΝΩΣΗ_Β (παλιό αρχείο) — γίνεται fallback σε "
+                "self.students_data (χρειάζεται προηγούμενο read_source_data)."
+            )
+
+        for row_idx in range(2, sheet.max_row + 1):
+            name_a = self._get_cell_value(sheet, row_idx, headers.get('ΜΑΘΗΤΗΣΑ'))
+            name_b = self._get_cell_value(sheet, row_idx, headers.get('ΜΑΘΗΤΗΣΒ'))
+            category = self._get_cell_value(sheet, row_idx, headers.get('ΚΑΤΗΓΟΡΙΑΔΥΑΔΑΣ'))
+            epidosh_raw = self._get_cell_value(sheet, row_idx, headers.get('ΕΠΙΔΟΣΗ'))
+            
+            if not name_a or not name_b or not category:
+                continue
+            
+            # Parse επίδοση
+            epidosh_a, epidosh_b = 1, 1
+            if ',' in epidosh_raw:
+                parts = epidosh_raw.split(',')
+                try:
+                    epidosh_a = int(parts[0].strip())
+                    epidosh_b = int(parts[1].strip())
+                except (ValueError, IndexError):
+                    pass
+
+            if has_raw_cols:
+                gender_a = self._get_cell_value(sheet, row_idx, headers.get('ΦΥΛΟΑ'), 'Α')
+                gender_b = self._get_cell_value(sheet, row_idx, headers.get('ΦΥΛΟΒ'), 'Α')
+                greek_a = self._get_cell_value(sheet, row_idx, headers.get('ΓΝΩΣΗΑ'), 'Ν')
+                greek_b = self._get_cell_value(sheet, row_idx, headers.get('ΓΝΩΣΗΒ'), 'Ν')
+                conflicts_a_raw = self._get_cell_value(sheet, row_idx, headers.get('ΣΥΓΚΡΟΥΣΗΑ'))
+                conflicts_b_raw = self._get_cell_value(sheet, row_idx, headers.get('ΣΥΓΚΡΟΥΣΗΒ'))
+                conflicts_a = _split_name_list(conflicts_a_raw)
+                conflicts_b = _split_name_list(conflicts_b_raw)
+                optional_a = str(self._get_cell_value(sheet, row_idx, headers.get('ΠΡΟΑΙΡΕΤΙΚΟΣΦΙΛΟΣΑ'), '') or '').strip()
+                optional_b = str(self._get_cell_value(sheet, row_idx, headers.get('ΠΡΟΑΙΡΕΤΙΚΟΣΦΙΛΟΣΒ'), '') or '').strip()
+                locked_val = self._get_cell_value(sheet, row_idx, headers.get('LOCKED'))
+                is_locked = (locked_val == 'LOCKED')
+            else:
+                # Fallback (backward-compatible) στο παλιό, εξαρτημένο από source
+                sa = self.students_data.get(name_a)
+                sb = self.students_data.get(name_b)
+                gender_a = sa.gender if sa else 'Α'
+                gender_b = sb.gender if sb else 'Α'
+                greek_a = sa.greek_knowledge if sa else 'Ν'
+                greek_b = sb.greek_knowledge if sb else 'Ν'
+                conflicts_a = sa.conflict_names if sa else []
+                conflicts_b = sb.conflict_names if sb else []
+                optional_a = sa.optional_friend if sa else ''
+                optional_b = sb.optional_friend if sb else ''
+                is_locked = (self._is_student_locked(sa) if sa else False) or \
+                            (self._is_student_locked(sb) if sb else False)
+
+            if name_a not in self.students:
+                self.students[name_a] = Student(
+                    name=name_a,
+                    choice=epidosh_a,
+                    gender=gender_a,
+                    greek_knowledge=greek_a,
+                    friends=[name_b],
+                    optional_friend=optional_a,
+                    conflict_names=conflicts_a,
+                    locked=is_locked
+                )
+            
+            if name_b not in self.students:
+                self.students[name_b] = Student(
+                    name=name_b,
+                    choice=epidosh_b,
+                    gender=gender_b,
+                    greek_knowledge=greek_b,
+                    friends=[name_a],
+                    optional_friend=optional_b,
+                    conflict_names=conflicts_b,
+                    locked=is_locked
+                )
+    
+    def _load_from_single(self, sheet: Worksheet) -> None:
+        """Διάβασμα μονών μαθητών από SINGLE sheet."""
+        headers = self._parse_headers(sheet)
+        
+        required = ['ΟΝΟΜΑ', 'ΦΥΛΟ', 'ΚΑΛΗΓΝΩΣΗΕΛΛΗΝΙΚΩΝ', 'ΕΠΙΔΟΣΗ']
+        missing = [h for h in required if h not in headers]
+        if missing:
+            return
+        
+        for row_idx in range(2, sheet.max_row + 1):
+            name = self._get_cell_value(sheet, row_idx, headers.get('ΟΝΟΜΑ'))
+            if not name:
+                continue
+            
+            if name in self.students:
+                continue
+            
+            gender_col = headers.get('ΦΥΛΟ')
+            greek_col = (headers.get('ΚΑΛΗΓΝΩΣΗΕΛΛΗΝΙΚΩΝ') or 
+                        headers.get('ΚΑΛΗ_ΓΝΩΣΗ_ΕΛΛΗΝΙΚΩΝ') or
+                        headers.get('ΚΑΛΗΓΝΩΣΗΕΛΛΗΝΙΚΩΝ'))
+            epidosh_col = headers.get('ΕΠΙΔΟΣΗ')
+            locked_col = headers.get('LOCKED')
+            
+            gender = self._get_cell_value(sheet, row_idx, gender_col, 'Α')
+            
+            # Greek knowledge
+            raw_greek = sheet.cell(row_idx, greek_col).value if greek_col else 'Ν'
+            if raw_greek:
+                greek_str = str(raw_greek).strip().upper()
+                if greek_str.startswith('Ν') or greek_str.startswith('N'):
+                    greek = 'Ν'
+                elif greek_str.startswith('Ο') or greek_str.startswith('O'):
+                    greek = 'Ο'
+                else:
+                    greek = 'Ν'
+            else:
+                greek = 'Ν'
+            
+            raw_epidosh = sheet.cell(row_idx, epidosh_col).value if epidosh_col else 1
+            try:
+                epidosh = int(raw_epidosh) if raw_epidosh else 1
+            except:
+                epidosh = 1
+            
+            locked_val = self._get_cell_value(sheet, row_idx, locked_col)
+            is_locked = (locked_val == 'LOCKED')
+
+            # FIX: πριν έπαιρνε conflicts μόνο από self.students_data (άδειο σε
+            # standalone optimize mode). Τώρα διαβάζει πρώτα τη στήλη
+            # ΣΥΓΚΡΟΥΣΗ του ίδιου SINGLE sheet, με fallback στην cache για
+            # συμβατότητα με παλιά αρχεία.
+            conflict_col = headers.get('ΣΥΓΚΡΟΥΣΗ')
+            if conflict_col is not None:
+                conflicts_raw = self._get_cell_value(sheet, row_idx, conflict_col)
+                conflict_names = _split_name_list(conflicts_raw)
+            else:
+                conflict_names = (
+                    self.students_data[name].conflict_names
+                    if name in self.students_data else []
+                )
+
+            optional_col = headers.get('ΠΡΟΑΙΡΕΤΙΚΟΣΦΙΛΟΣ')
+            optional_names = _split_name_list(
+                self._get_cell_value(sheet, row_idx, optional_col, '')
+            )
+            if len(optional_names) > 2:
+                self.warnings.append(
+                    f"⚠️ Μαθητής {name}: βρέθηκαν πάνω από 2 προαιρετικοί φίλοι "
+                    "στο SINGLE· θα χρησιμοποιηθούν μόνο οι 2 πρώτοι."
+                )
+            optional_friend = ', '.join(optional_names[:2])
+
+            self.students[name] = Student(
+                name=name,
+                choice=epidosh,
+                gender=gender,
+                greek_knowledge=greek,
+                friends=[],
+                optional_friend=optional_friend,
+                conflict_names=conflict_names,
+                locked=is_locked
+            )
+    
+    def calculate_spreads(self) -> Dict[str, int]:
+        """Υπολογισμός spreads για επίδοση 5→1→4→2, ελληνικά και φύλο."""
+        stats = self._get_team_stats()
+        return self._spreads_from_stats(stats)
+
+    @staticmethod
+    def _spreads_from_stats(stats: Dict) -> Dict[str, int]:
+        """PERF FIX: εξάγει τα spreads από ΗΔΗ υπολογισμένο stats dict, χωρίς
+        να ξαναδιαβάζει όλους τους μαθητές. Πριν, calculate_spreads() και
+        _calc_spreads_after() καλούσαν _get_team_stats() (πλήρες πέρασμα O(N)
+        σε όλους τους μαθητές) ξεχωριστά για ΚΑΘΕ υποψήφιο swap σε κάθε
+        iteration — πρακτικά O(iterations × candidates × N). Τώρα το πέρασμα
+        αυτό γίνεται μία φορά ανά iteration και εδώ απλώς συγκρίνουμε ήδη
+        υπολογισμένα νούμερα ανά τμήμα (O(teams)).
+        """
+        if not stats:
+            return {
+                'ep5': 0, 'ep1': 0, 'ep4': 0, 'ep2': 0, 'ep3': 0,
+                'boys': 0, 'girls': 0, 'greek_yes': 0
+            }
+
+        def _spread(key: str) -> int:
+            vals = [s[key] for s in stats.values()]
+            return max(vals) - min(vals) if vals else 0
+
+        return {
+            # Ιεραρχία επίδοσης για swaps: 5 → 1 → 4 → 2
+            'ep5': _spread('ep5'),
+            'ep1': _spread('ep1'),
+            'ep4': _spread('ep4'),
+            'ep2': _spread('ep2'),
+            # Κρατάμε και ep3 για αναφορά/συμβατότητα, αλλά δεν είναι προτεραιότητα swap.
+            'ep3': _spread('ep3'),
+            'boys': _spread('boys'),
+            'girls': _spread('girls'),
+            'greek_yes': _spread('greek_yes')
+        }
+
+    def _get_team_stats(self) -> Dict:
+        """Μέτρηση στατιστικών ανά τμήμα με canonical έλεγχο ονομάτων."""
+        stats = {}
+
+        team_by_canon = {}
+        original_by_canon = {}
+        for team_name, student_names in self.teams.items():
+            for name in student_names:
+                canon = _canon_name(name)
+                if canon:
+                    team_by_canon[canon] = team_name
+                    original_by_canon[canon] = name
+
+        conflict_pairs = set()
+        for name, student in self.students.items():
+            a = _canon_name(name)
+            if not a:
+                continue
+            for other in student.conflict_names:
+                b = _canon_name(other)
+                if a and b and a != b and b in team_by_canon:
+                    conflict_pairs.add(tuple(sorted((a, b))))
+
+        conflict_count_by_team = {team: 0 for team in self.teams}
+        for a, b in conflict_pairs:
+            ta = team_by_canon.get(a)
+            tb = team_by_canon.get(b)
+            if ta and ta == tb:
+                conflict_count_by_team[ta] += 1
+
+        mutual_pairs = set()
+        for name, student in self.students.items():
+            a = _canon_name(name)
+            if not a:
+                continue
+            for friend in student.friends:
+                b = _canon_name(friend)
+                if not b or a == b or b not in original_by_canon:
+                    continue
+                friend_name = original_by_canon[b]
+                friend_student = self.students.get(friend_name)
+                if friend_student and _name_in_list(name, friend_student.friends):
+                    mutual_pairs.add(tuple(sorted((a, b))))
+
+        broken_count_by_team = {team: 0 for team in self.teams}
+        for a, b in mutual_pairs:
+            ta = team_by_canon.get(a)
+            tb = team_by_canon.get(b)
+            if ta and tb and ta != tb:
+                broken_count_by_team[ta] += 1
+                broken_count_by_team[tb] += 1
+
+        for team_name, student_names in self.teams.items():
+            boys = girls = greek_yes = greek_no = 0
+            ep1 = ep2 = ep3 = ep4 = ep5 = 0
+            teacher_count = calm_count = special_count = 0
+
+            for name in student_names:
+                if name not in self.students:
+                    continue
+
+                s = self.students[name]
+
+                if s.gender == 'Α':
+                    boys += 1
+                elif s.gender == 'Κ':
+                    girls += 1
+
+                if s.greek_knowledge in ['Ν', 'N']:
+                    greek_yes += 1
+                elif s.greek_knowledge in ['Ο', 'O']:
+                    greek_no += 1
+
+                if s.choice == 1:
+                    ep1 += 1
+                elif s.choice == 2:
+                    ep2 += 1
+                elif s.choice == 3:
+                    ep3 += 1
+                elif s.choice == 4:
+                    ep4 += 1
+                elif s.choice == 5:
+                    ep5 += 1
+
+                source_student = self.students_data.get(name)
+                if source_student:
+                    if str(source_student.teacher_child).strip().upper() in {'Ν', 'N'}:
+                        teacher_count += 1
+                    if str(source_student.calm).strip().upper() in {'Ν', 'N'}:
+                        calm_count += 1
+                    if str(source_student.special_needs).strip().upper() in {'Ν', 'N'}:
+                        special_count += 1
+
+            stats[team_name] = {
+                'boys': boys,
+                'girls': girls,
+                'greek_yes': greek_yes,
+                'greek_no': greek_no,
+                'ep1': ep1,
+                'ep2': ep2,
+                'ep3': ep3,
+                'ep4': ep4,
+                'ep5': ep5,
+                'teacher_count': teacher_count,
+                'calm_count': calm_count,
+                'special_count': special_count,
+                'conflict_violations': conflict_count_by_team.get(team_name, 0),
+                'broken_friendships': broken_count_by_team.get(team_name, 0),
+            }
+
+        return stats
+
+    # ---- Σταθερά ορίων (MAX_SPREAD) ----
+    MAX_SPREAD_EPIDOSIS = 2
+    MAX_SPREAD_GREEK    = 2
+    MAX_SPREAD_GENDER   = 2
+
+    PERFORMANCE_PRIORITY = ('ep5', 'ep1', 'ep4', 'ep2')
+    SWAP_PRIORITY_ORDER = ('ep5', 'ep1', 'ep4', 'ep2', 'greek_yes', 'gender')
+
+    def optimize(self, max_iterations: int = 200) -> Tuple[List[Dict], Dict]:
+        """
+        Ιεραρχημένη πολυκριτηριακή βελτιστοποίηση με swaps, σε ΔΥΟ διαδοχικούς
+        κύκλους (όπως περιγράφεται στην §4.2 του άρθρου):
+
+        - Κύκλος 1 (αυστηρός): επιδιώκει βελτίωση της κατανομής επίδοσης
+          (5→1→4→2) ΧΩΡΙΣ καμία απολύτως επιδείνωση στην ισορροπία φύλου ή
+          γλωσσικής επάρκειας. Τρέχει μέχρι να μην υπάρχουν άλλα νόμιμα
+          βελτιωτικά swaps υπό αυτόν τον αυστηρό περιορισμό.
+        - Κύκλος 2 (ελεγχόμενης υποβάθμισης): ενεργοποιείται ΜΟΝΟ αν, μετά
+          τον Κύκλο 1, κάποιο κριτήριο επίδοσης παραμένει εκτός ορίου
+          (spread > MAX_SPREAD_EPIDOSIS). Επιτρέπει περιορισμένη υποβάθμιση
+          γλώσσας/φύλου, πάντα εντός του ήδη καθορισμένου αποδεκτού ορίου
+          (≤2), το οποίο δεν ξεπερνιέται ποτέ, και μόνο εφόσον βελτιώνει
+          τουλάχιστον ένα κριτήριο επίδοσης.
+
+        Hard rules (ισχύουν και στους δύο κύκλους):
+        - Δεν δημιουργεί δηλωμένη ΣΥΓΚΡΟΥΣΗ.
+        - Δεν μετακινεί locked μαθητές.
+        - Δεν σπάει πλήρως αμοιβαίες δυάδες.
+        - Ποτέ δεν επιτρέπεται spread > MAX_SPREAD (επίδοση/γλώσσα/φύλο) πέρα
+          από ό,τι ίσχυε ήδη πριν το swap (βλ. _smart_ok).
+
+        Ιεραρχία βελτίωσης:
+        1. Επίδοση 5
+        2. Επίδοση 1
+        3. Επίδοση 4
+        4. Επίδοση 2
+        5. Καλή γνώση ελληνικών
+        6. Φύλο
+        """
+        MAX_EP  = self.MAX_SPREAD_EPIDOSIS
+        MAX_GR  = self.MAX_SPREAD_GREEK
+        MAX_GEN = self.MAX_SPREAD_GENDER
+
+        applied_swaps: List[Dict] = []
+
+        print(f"🔄 Ξεκινά ιεραρχημένη βελτιστοποίηση σε 2 κύκλους (max {max_iterations} iterations)...")
+        print(f"   Ιεραρχία επίδοσης: 5 → 1 → 4 → 2 | Όρια: επίδοση≤{MAX_EP}, γλώσσα≤{MAX_GR}, φύλο≤{MAX_GEN}")
+
+        # ---- ΚΥΚΛΟΣ 1: αυστηρός — καμία επιδείνωση γλώσσας/φύλου ----
+        print(f"\n➡️  Κύκλος 1/2 (χωρίς καμία επιδείνωση γλώσσας/φύλου)...")
+        cycle1_swaps, iterations_used = self._run_swap_cycle(
+            cycle=1, strict_greek_gender=True,
+            max_iterations=max_iterations, iterations_used=0,
+            max_ep=MAX_EP, max_gr=MAX_GR, max_gen=MAX_GEN,
+        )
+        applied_swaps.extend(cycle1_swaps)
+
+        # ---- ΚΥΚΛΟΣ 2: ελεγχόμενη υποβάθμιση εντός ορίου (≤2) ----
+        spreads_after_cycle1 = self.calculate_spreads()
+        performance_still_over_limit = any(
+            spreads_after_cycle1[k] > MAX_EP for k in self.PERFORMANCE_PRIORITY
+        )
+        remaining_iterations = max_iterations - iterations_used
+
+        if performance_still_over_limit and remaining_iterations > 0:
+            print(f"\n➡️  Κύκλος 2/2 (επιτρέπεται περιορισμένη υποβάθμιση "
+                  f"γλώσσας/φύλου, πάντα εντός ορίου ≤{MAX_GR}/{MAX_GEN})...")
+            cycle2_swaps, iterations_used = self._run_swap_cycle(
+                cycle=2, strict_greek_gender=False,
+                max_iterations=max_iterations, iterations_used=iterations_used,
+                max_ep=MAX_EP, max_gr=MAX_GR, max_gen=MAX_GEN,
+            )
+            applied_swaps.extend(cycle2_swaps)
+        else:
+            reason = "όρια εντός στόχου" if not performance_still_over_limit else "εξαντλήθηκαν τα iterations"
+            print(f"\n✅ Κύκλος 2 δεν χρειάστηκε ({reason}).")
+
+        if iterations_used >= max_iterations:
+            print(f"⚠️ Έφτασε το συνολικό όριο των {max_iterations} iterations.")
+
+        # ---- ΚΥΚΛΟΣ 3: κοινωνική αποκατάσταση μέσω προαιρετικού φίλου ----
+        # Ο εντοπισμός αφορά ΜΟΝΟ locked μαθητές με σπασμένη βασική αμοιβαία
+        # φιλία. Οι locked μαθητές δεν μετακινούνται ποτέ. Μετακινείται προς
+        # το τμήμα τους ο προαιρετικός φίλος είτε ως solo είτε μαζί με την
+        # αδιαίρετη βασική αμοιβαία δυάδα του.
+        print("\n➡️  Κύκλος 3/3 (προαιρετικός φίλος για locked μαθητές με σπασμένη φιλία)...")
+        cycle3_swaps = self._run_optional_friend_cycle(MAX_EP, MAX_GR, MAX_GEN)
+        applied_swaps.extend(cycle3_swaps)
+
+        final_spreads = self.calculate_spreads()
+        n_cycle1 = sum(1 for s in applied_swaps if s.get('cycle') == 1)
+        n_cycle2 = sum(1 for s in applied_swaps if s.get('cycle') == 2)
+        n_cycle3 = sum(1 for s in applied_swaps if s.get('cycle') == 3)
+        print(f"✅ Optimization ολοκληρώθηκε: {len(applied_swaps)} swaps "
+              f"(Κύκλος 1: {n_cycle1}, Κύκλος 2: {n_cycle2}, Κύκλος 3: {n_cycle3})")
+        print(f"   Final spreads: EP5={final_spreads['ep5']}, EP1={final_spreads['ep1']}, "
+              f"EP4={final_spreads['ep4']}, EP2={final_spreads['ep2']}, "
+              f"Greek={final_spreads['greek_yes']}, Boys={final_spreads['boys']}, Girls={final_spreads['girls']}")
+
+        return applied_swaps, final_spreads
+
+    def _team_of(self, name: str) -> Optional[str]:
+        """Επιστρέφει το τμήμα του μαθητή με canonical αντιστοίχιση."""
+        target = _canon_name(name)
+        for team_name, names in self.teams.items():
+            if any(_canon_name(n) == target for n in names):
+                return team_name
+        return None
+
+    def _mutual_partner_in_team(self, name: str, team_name: str) -> Optional[str]:
+        """Βρίσκει τον βασικό αμοιβαίο φίλο του μαθητή στο συγκεκριμένο τμήμα."""
+        student = self.students.get(name)
+        if not student:
+            return None
+        for other in self.teams.get(team_name, []):
+            if other == name or other not in self.students:
+                continue
+            if _are_mutual_friends(name, student.friends, other, self.students[other].friends):
+                return other
+        return None
+
+    def _locked_students_with_broken_mutual_friendship(self) -> List[Dict]:
+        """Εντοπίζει μόνο locked μαθητές των οποίων η βασική αμοιβαία φιλία έσπασε."""
+        result: List[Dict] = []
+        seen = set()
+        for name, student in self.students.items():
+            if not student.locked or not student.optional_friend:
+                continue
+            own_team = self._team_of(name)
+            if not own_team:
+                continue
+            for friend_ref in student.friends:
+                friend_c = _canon_name(friend_ref)
+                friend_name = next((n for n in self.students if _canon_name(n) == friend_c), None)
+                if not friend_name:
+                    continue
+                friend = self.students[friend_name]
+                if not _are_mutual_friends(name, student.friends, friend_name, friend.friends):
+                    continue
+                friend_team = self._team_of(friend_name)
+                if friend_team and friend_team != own_team:
+                    key = (_canon_name(name), _canon_name(friend_name))
+                    if key not in seen:
+                        result.append({
+                            'locked_student': name,
+                            'locked_team': own_team,
+                            'basic_friend': friend_name,
+                            'basic_friend_team': friend_team,
+                            'optional_friend': student.optional_friend,
+                        })
+                        seen.add(key)
+                    break
+        return result
+
+    def _pedagogical_pair_penalty(self, name_a: str, name_b: str) -> int:
+        """
+        Επιστρέφει την παιδαγωγική ποινή Pped για μία συνύπαρξη:
+        - 5: δύο μαθητές με ΙΔΙΑΙΤΕΡΟΤΗΤΑ=Ν
+        - 4: μαθητής με ΙΔΙΑΙΤΕΡΟΤΗΤΑ=Ν μαζί με μαθητή με συμπεριφορική ένδειξη
+        - 3: δύο μαθητές με συμπεριφορική ένδειξη
+
+        Αν ισχύουν περισσότερες από μία περιπτώσεις, κρατείται η μεγαλύτερη
+        ποινή. Οι τιμές ΖΩΗΡΟΣ Ν, Ν1, Ν2 ή Ν3 θεωρούνται συμπεριφορική ένδειξη.
+        """
+        data_a = self.students_data.get(name_a)
+        data_b = self.students_data.get(name_b)
+        if data_a is None or data_b is None:
+            return 0
+
+        def _is_special(data: StudentData) -> bool:
+            return str(data.special_needs).strip().upper() in {'Ν', 'N'}
+
+        def _is_behavioral(data: StudentData) -> bool:
+            value = str(data.calm).strip().upper()
+            return value in {'Ν', 'N', 'Ν1', 'N1', 'Ν2', 'N2', 'Ν3', 'N3'}
+
+        special_a, special_b = _is_special(data_a), _is_special(data_b)
+        behavior_a, behavior_b = _is_behavioral(data_a), _is_behavioral(data_b)
+
+        penalties = [0]
+        if special_a and special_b:
+            penalties.append(5)
+        if (special_a and behavior_b) or (special_b and behavior_a):
+            penalties.append(4)
+        if behavior_a and behavior_b:
+            penalties.append(3)
+        return max(penalties)
+
+    def _calculate_total_pped(self, teams: Optional[Dict[str, List[str]]] = None) -> int:
+        """Υπολογίζει το συνολικό Pped όλων των τμημάτων."""
+        teams_map = teams if teams is not None else self.teams
+        total = 0
+        for names in teams_map.values():
+            for i, name_a in enumerate(names):
+                for name_b in names[i + 1:]:
+                    total += self._pedagogical_pair_penalty(name_a, name_b)
+        return total
+
+    def _pped_after_hypothetical_swap(
+        self, from_team: str, names_out: List[str],
+        to_team: str, names_in: List[str],
+    ) -> int:
+        """Υπολογίζει το Pped μετά από υποθετική ισομεγέθη ανταλλαγή."""
+        hypothetical = {team: list(names) for team, names in self.teams.items()}
+        for name in names_out:
+            if name in hypothetical.get(from_team, []):
+                hypothetical[from_team].remove(name)
+        for name in names_in:
+            if name in hypothetical.get(to_team, []):
+                hypothetical[to_team].remove(name)
+        hypothetical[from_team].extend(names_in)
+        hypothetical[to_team].extend(names_out)
+        return self._calculate_total_pped(hypothetical)
+
+    def _optional_swap_preserves_higher_rules(
+        self, stats_before: Dict, from_team: str, names_out: List[str],
+        to_team: str, names_in: List[str], max_ep: int, max_gr: int, max_gen: int,
+    ) -> bool:
+        """
+        Ο Κύκλος 3 δεν επιδεινώνει κανένα ανώτερο κριτήριο: σύγκρουση,
+        επίδοση, ελληνικά, φύλο και συνολικό Pped.
+        """
+        if self._swap_creates_conflict(from_team, names_out, to_team, names_in):
+            return False
+        before = self._spreads_from_stats(stats_before)
+        after = self._calc_spreads_after(stats_before, from_team, names_out, to_team, names_in)
+        gender_before = max(before['boys'], before['girls'])
+        gender_after = max(after['boys'], after['girls'])
+        for key in self.PERFORMANCE_PRIORITY:
+            if after[key] > before[key] or after[key] > max(max_ep, before[key]):
+                return False
+        if after['greek_yes'] > before['greek_yes'] or after['greek_yes'] > max(max_gr, before['greek_yes']):
+            return False
+        if gender_after > gender_before or gender_after > max(max_gen, gender_before):
+            return False
+
+        # ΝΕΟ HARD GUARD: η κοινωνική αποκατάσταση δεν επιτρέπεται να
+        # αυξήσει το συνολικό παιδαγωγικό φορτίο Pped.
+        pped_before = self._calculate_total_pped()
+        pped_after = self._pped_after_hypothetical_swap(
+            from_team, names_out, to_team, names_in
+        )
+        if pped_after > pped_before:
+            return False
+
+        return True
+
+    def _run_optional_friend_cycle(self, max_ep: int, max_gr: int, max_gen: int) -> List[Dict]:
+        """
+        Κύκλος 3: φέρνει προς τον locked μαθητή τον πρώτο νόμιμο
+        προαιρετικό φίλο, ποτέ τον locked μαθητή προς τον φίλο.
+
+        Η στήλη ΠΡΟΑΙΡΕΤΙΚΟΣ_ΦΙΛΟΣ δέχεται έως 2 ονόματα με σειρά
+        προτεραιότητας. Το δεύτερο εξετάζεται μόνο όταν το πρώτο δεν μπορεί
+        να μετακινηθεί νόμιμα.
+        """
+        applied: List[Dict] = []
+        targets = self._locked_students_with_broken_mutual_friendship()
+        if not targets:
+            print("   ✅ Δεν υπάρχουν locked μαθητές με σπασμένη βασική φιλία και δηλωμένο προαιρετικό φίλο.")
+            return applied
+
+        for target in targets:
+            locked_name = target['locked_student']
+            locked_team = self._team_of(locked_name)
+            if not locked_team:
+                continue
+
+            optional_choices = _split_name_list(target['optional_friend'])[:2]
+            restored = False
+
+            for choice_index, optional_ref in enumerate(optional_choices, start=1):
+                optional_c = _canon_name(optional_ref)
+                optional_name = next(
+                    (n for n in self.students if _canon_name(n) == optional_c),
+                    None,
+                )
+                if not optional_name:
+                    self.warnings.append(
+                        f"⚠️ {locked_name}: ο προαιρετικός φίλος επιλογής "
+                        f"{choice_index} ({optional_ref}) δεν βρέθηκε στους μαθητές."
+                    )
+                    continue
+
+                optional_team = self._team_of(optional_name)
+                if not optional_team:
+                    continue
+
+                # Ήδη μαζί: η κοινωνική υποστήριξη υπάρχει χωρίς μετακίνηση.
+                if optional_team == locked_team:
+                    print(
+                        f"   ✅ {locked_name}: ο προαιρετικός φίλος επιλογής "
+                        f"{choice_index} ({optional_name}) βρίσκεται ήδη στο {locked_team}."
+                    )
+                    restored = True
+                    break
+
+                optional_student = self.students[optional_name]
+                if optional_student.locked:
+                    continue
+
+                partner = self._mutual_partner_in_team(optional_name, optional_team)
+                if partner:
+                    if self.students[partner].locked:
+                        continue
+                    names_in = [optional_name, partner]
+                    candidate_out_groups = [
+                        [p['name_a'], p['name_b']]
+                        for p in self._get_movable_pairs(locked_team)
+                    ]
+                    swap_type = 'Optional Pair↔Pair'
+                else:
+                    names_in = [optional_name]
+                    candidate_out_groups = [
+                        [s['name']] for s in self._get_movable_solos(locked_team)
+                        if s['name'] != locked_name
+                    ]
+                    swap_type = 'Optional Solo↔Solo'
+
+                stats_before = self._get_team_stats()
+                valid: List[Dict] = []
+                for names_out in candidate_out_groups:
+                    if locked_name in names_out:
+                        continue
+                    if not self._optional_swap_preserves_higher_rules(
+                        stats_before, locked_team, names_out, optional_team, names_in,
+                        max_ep, max_gr, max_gen,
+                    ):
+                        continue
+                    valid.append({
+                        'type': swap_type,
+                        'from_team': locked_team,
+                        'students_out': names_out,
+                        'to_team': optional_team,
+                        'students_in': names_in,
+                        'priority': 3,
+                        'cycle': 3,
+                        'social_restoration': {
+                            'locked_student': locked_name,
+                            'broken_basic_friend': target['basic_friend'],
+                            'optional_friend': optional_name,
+                            'optional_priority': choice_index,
+                            'optional_group': names_in,
+                        },
+                        'improvement': {
+                            'improves': True,
+                            'reason': 'optional_friend_support_for_locked_student',
+                            'delta_ep5': 0, 'delta_ep1': 0, 'delta_ep4': 0,
+                            'delta_ep2': 0, 'delta_greek': 0, 'delta_gender': 0,
+                        },
+                    })
+
+                if valid:
+                    # Αναπαραγώγιμη επιλογή ανάμεσα στις νόμιμες ανταλλαγές
+                    # της ίδιας προτεραιότητας.
+                    valid.sort(
+                        key=lambda x: tuple(
+                            _canon_name(n) for n in x['students_out']
+                        )
+                    )
+                    chosen = valid[0]
+                    self._apply_swap(chosen)
+                    applied.append(chosen)
+                    print(
+                        f"   ✅ Κοινωνική αποκατάσταση για {locked_name} με "
+                        f"προαιρετική επιλογή {choice_index}: "
+                        f"{', '.join(names_in)} → {locked_team}"
+                    )
+                    restored = True
+                    break  # Δεν εξετάζεται η δεύτερη επιλογή μετά από επιτυχία.
+
+            if not restored and optional_choices:
+                print(
+                    f"   ℹ️ {locked_name}: καμία από τις έως 2 προαιρετικές "
+                    "επιλογές δεν μπορούσε να μετακινηθεί νόμιμα."
+                )
+
+        if not applied:
+            print("   ℹ️ Δεν εφαρμόστηκε ανταλλαγή προαιρετικού φίλου χωρίς επιδείνωση ανώτερων κριτηρίων.")
+        return applied
+
+    def _run_swap_cycle(self, cycle: int, strict_greek_gender: bool,
+                         max_iterations: int, iterations_used: int,
+                         max_ep: int, max_gr: int, max_gen: int) -> Tuple[List[Dict], int]:
+        """
+        Τρέχει επαναληπτικά swaps για έναν κύκλο (1 ή 2) μέχρι να μην
+        υπάρχουν άλλα νόμιμα βελτιωτικά swaps ή να εξαντληθεί το κοινό
+        (και για τους δύο κύκλους) budget iterations.
+
+        Επιστρέφει τα swaps που εφαρμόστηκαν σε αυτόν τον κύκλο και το
+        ενημερωμένο πλήθος iterations που έχουν χρησιμοποιηθεί συνολικά.
+        """
+        cycle_swaps: List[Dict] = []
+
+        while iterations_used < max_iterations:
+            # PERF FIX: υπολογίζουμε τα team stats ΜΙΑ φορά ανά iteration
+            # (όχι μία φορά ανά υποψήφιο swap) και τα περνάμε παρακάτω.
+            stats_before_iter = self._get_team_stats()
+            # PERF FIX: τα movable solos/pairs ενός τμήματος υπολογίζονταν
+            # ξανά για κάθε ζεύγος τμημάτων στο οποίο συμμετείχε (T-1 φορές).
+            # Τώρα υπολογίζονται μία φορά ανά τμήμα, ανά iteration.
+            solos_map = {t: self._get_movable_solos(t) for t in self.teams}
+            pairs_map = {t: self._get_movable_pairs(t) for t in self.teams}
+            all_candidate_swaps = self._generate_all_valid_swaps(
+                stats_before_iter, solos_map, pairs_map, max_ep, max_gr, max_gen,
+                strict_greek_gender=strict_greek_gender, cycle=cycle,
+            )
+
+            if not all_candidate_swaps:
+                print(f"   ✅ Δεν υπάρχουν άλλες νόμιμες βελτιωτικές ανταλλαγές "
+                      f"(Κύκλος {cycle}, iteration {iterations_used}). Ο κύκλος ολοκληρώθηκε.")
+                break
+
+            best_swap = self._select_best_swap_hierarchical(all_candidate_swaps)
+            if not best_swap:
+                print(f"   ✅ Δεν βρέθηκε καλύτερη ανταλλαγή (Κύκλος {cycle}, iteration {iterations_used}).")
+                break
+
+            self._apply_swap(best_swap)
+            cycle_swaps.append(best_swap)
+            iterations_used += 1
+
+            if iterations_used % 10 == 0:
+                spreads = self.calculate_spreads()
+                print(f"   Κύκλος {cycle} — iteration {iterations_used}: {len(cycle_swaps)} swaps | "
+                      f"EP5={spreads['ep5']} EP1={spreads['ep1']} "
+                      f"EP4={spreads['ep4']} EP2={spreads['ep2']} "
+                      f"GR={spreads['greek_yes']} B={spreads['boys']} G={spreads['girls']}")
+
+        return cycle_swaps, iterations_used
+
+    def _generate_all_valid_swaps(self, stats_before: Dict, solos_map: Dict, pairs_map: Dict,
+                                   max_ep: int, max_gr: int, max_gen: int,
+                                   strict_greek_gender: bool = True, cycle: int = 1) -> List[Dict]:
+        """
+        Εξαντλητική αναζήτηση σε ΟΛΑ τα ζεύγη τμημάτων.
+        Επιστρέφει μόνο swaps που περνούν τα hard rules και βελτιώνουν την ιεραρχία.
+
+        strict_greek_gender: True για τον Κύκλο 1 (καμία επιδείνωση γλώσσας/
+        φύλου επιτρεπτή)· False για τον Κύκλο 2 (επιτρέπεται περιορισμένη
+        υποβάθμιση, πάντα εντός των ορίων max_gr/max_gen). Βλ. _try_swap.
+
+        PERF FIX: το stats_before, καθώς και τα movable solos/pairs ανά τμήμα,
+        υπολογίζονται μία φορά ανά iteration από τον caller (optimize) και
+        περνιούνται εδώ, αντί να ξαναϋπολογίζονται μέσα σε κάθε _try_swap ή
+        για κάθε ζεύγος τμημάτων ξεχωριστά.
+        """
+        team_names = list(self.teams.keys())
+        all_swaps = []
+
+        for i, team_a in enumerate(team_names):
+            for team_b in team_names[i+1:]:
+                all_swaps.extend(
+                    self._generate_swaps_for_pair(
+                        team_a, team_b, stats_before, solos_map, pairs_map,
+                        max_ep, max_gr, max_gen,
+                        strict_greek_gender=strict_greek_gender, cycle=cycle,
+                    )
+                )
+
+        return all_swaps
+
+    def _generate_swaps_for_pair(self, team_a: str, team_b: str, stats_before: Dict,
+                                  solos_map: Dict, pairs_map: Dict,
+                                  max_ep: int, max_gr: int, max_gen: int,
+                                  strict_greek_gender: bool = True, cycle: int = 1) -> List[Dict]:
+        """
+        Δημιουργεί νόμιμες ανταλλαγές μεταξύ δύο τμημάτων.
+        Εξετάζει:
+        - Solo ↔ Solo για μαθητές χωρίς πλήρως αμοιβαία δυάδα στο τμήμα τους.
+        - Pair ↔ Pair για πλήρως αμοιβαίες δυάδες.
+        Δεν εξετάζει Solo ↔ Pair για να μην αλλάζει αριθμούς τμημάτων.
+        """
+        swaps = []
+
+        solos_a = solos_map[team_a]
+        solos_b = solos_map[team_b]
+        pairs_a = pairs_map[team_a]
+        pairs_b = pairs_map[team_b]
+
+        for s_a in solos_a:
+            for s_b in solos_b:
+                swap = self._try_swap(team_a, [s_a['name']], team_b, [s_b['name']],
+                                      'Solo↔Solo', 1, stats_before, max_ep, max_gr, max_gen,
+                                      strict_greek_gender=strict_greek_gender, cycle=cycle)
+                if swap:
+                    swaps.append(swap)
+
+        for p_a in pairs_a:
+            for p_b in pairs_b:
+                swap = self._try_swap(team_a, [p_a['name_a'], p_a['name_b']],
+                                      team_b, [p_b['name_a'], p_b['name_b']],
+                                      'Pair↔Pair', 2, stats_before, max_ep, max_gr, max_gen,
+                                      strict_greek_gender=strict_greek_gender, cycle=cycle)
+                if swap:
+                    swaps.append(swap)
+
+        return swaps
+
+    def _swap_creates_conflict(
+        self,
+        from_team: str, names_out: List[str],
+        to_team: str,   names_in: List[str],
+    ) -> bool:
+        """
+        Επιστρέφει True αν το swap θα τοποθετήσει μαθητή σε τμήμα
+        που περιέχει κάποιον με δηλωμένη σύγκρουση (αμφίδρομος έλεγχος).
+        """
+        names_out_set = set(names_out)
+        names_in_set  = set(names_in)
+
+        def _conflicts_of(name: str) -> set:
+            s = self.students.get(name)
+            return {_canon_name(x) for x in s.conflict_names} if s else set()
+
+        def _check(movers: List[str], target_team: str, leaving: set) -> bool:
+            staying = [n for n in self.teams.get(target_team, []) if n not in leaving]
+            for mover in movers:
+                mover_c = _canon_name(mover)
+                conf_mover = _conflicts_of(mover)
+                for member in staying:
+                    member_c = _canon_name(member)
+                    if member_c in conf_mover:
+                        return True
+                    if mover_c in _conflicts_of(member):
+                        return True
+            return False
+
+        if _check(names_out, to_team, names_in_set):
+            return True
+        if _check(names_in, from_team, names_out_set):
+            return True
+        return False
+
+    def _try_swap(self, from_team: str, names_out: List[str],
+                  to_team: str, names_in: List[str],
+                  swap_type: str, priority: int, stats_before: Dict,
+                  max_ep: int, max_gr: int, max_gen: int,
+                  strict_greek_gender: bool = True, cycle: int = 1) -> Optional[Dict]:
+        """
+        Smart-spread validation με ιεραρχία 5 → 1 → 4 → 2 → Ελληνικά → Φύλο.
+
+        Δέχεται swap μόνο αν:
+        - Δεν δημιουργεί ΣΥΓΚΡΟΥΣΗ.
+        - Κρατά όλα τα βασικά spreads μέσα στα όρια ή τα μειώνει όταν είναι ήδη πάνω από όριο
+          (βλ. _smart_ok) — αυτό το hard bound (≤ max_gr/max_gen) ΠΟΤΕ δεν παραβιάζεται,
+          ανεξάρτητα από κύκλο.
+        - Δεν χειροτερεύει κανένα από τα κριτήρια επίδοσης (5→1→4→2) σε ΚΑΝΕΝΑΝ κύκλο.
+        - Βελτιώνει τουλάχιστον ένα κριτήριο της ιεραρχίας.
+
+        strict_greek_gender (δύο κύκλοι σύμφωνα με §4.2 του άρθρου):
+        - True  (Κύκλος 1): επιπλέον απαιτείται να ΜΗΝ χειροτερεύουν καθόλου
+          η γλωσσική επάρκεια ή το φύλο (delta_greek/delta_gender ≥ 0).
+        - False (Κύκλος 2): επιτρέπεται περιορισμένη υποβάθμιση γλώσσας/
+          φύλου (delta < 0), αρκεί να παραμένουν εντός του ήδη
+          καθορισμένου αποδεκτού ορίου (≤ max_gr/max_gen μέσω _smart_ok) και
+          το swap να βελτιώνει τουλάχιστον ένα κριτήριο επίδοσης — αλλιώς η
+          «θυσία» γλώσσας/φύλου δεν έχει νόημα.
+
+        PERF FIX: το stats_before περνιέται έτοιμο (υπολογισμένο μία φορά ανά
+        iteration) αντί να καλείται self.calculate_spreads() (πλήρες πέρασμα
+        O(N) σε όλους τους μαθητές) ξεχωριστά για κάθε υποψήφιο swap.
+        """
+        spreads_before = self._spreads_from_stats(stats_before)
+        spreads_after  = self._calc_spreads_after(stats_before, from_team, names_out, to_team, names_in)
+
+        # Hard constraint: δηλωμένη ΣΥΓΚΡΟΥΣΗ.
+        if self._swap_creates_conflict(from_team, names_out, to_team, names_in):
+            return None
+
+        gender_before = max(spreads_before['boys'], spreads_before['girls'])
+        gender_after  = max(spreads_after['boys'],  spreads_after['girls'])
+
+        def _smart_ok(before: int, after: int, limit: int) -> bool:
+            if before > limit:
+                return after <= before  # FIX: επιτρέπει "να μη χειροτερεύει" (όχι μόνο αυστηρή βελτίωση)
+            return after <= limit
+
+        # Hard bound (≤ max_ep/max_gr/max_gen): ισχύει ΠΑΝΤΑ, και στους δύο κύκλους.
+        for key in self.PERFORMANCE_PRIORITY:
+            if not _smart_ok(spreads_before[key], spreads_after[key], max_ep):
+                return None
+        if not _smart_ok(spreads_before['greek_yes'], spreads_after['greek_yes'], max_gr):
+            return None
+        if not _smart_ok(gender_before, gender_after, max_gen):
+            return None
+
+        deltas = {
+            'delta_ep5': spreads_before['ep5'] - spreads_after['ep5'],
+            'delta_ep1': spreads_before['ep1'] - spreads_after['ep1'],
+            'delta_ep4': spreads_before['ep4'] - spreads_after['ep4'],
+            'delta_ep2': spreads_before['ep2'] - spreads_after['ep2'],
+            'delta_greek': spreads_before['greek_yes'] - spreads_after['greek_yes'],
+            'delta_gender': gender_before - gender_after,
+            'delta_boys': spreads_before['boys'] - spreads_after['boys'],
+            'delta_girls': spreads_before['girls'] - spreads_after['girls'],
+            # Συμβατότητα με παλιότερα logs/κλήσεις.
+            'delta_ep3': spreads_before.get('ep3', 0) - spreads_after.get('ep3', 0),
+        }
+
+        performance_keys = ['delta_ep5', 'delta_ep1', 'delta_ep4', 'delta_ep2']
+
+        # No harm στα κριτήρια επίδοσης — ισχύει ΠΑΝΤΑ, ανεξαρτήτως κύκλου.
+        if any(deltas[k] < 0 for k in performance_keys):
+            return None
+
+        if strict_greek_gender:
+            # Κύκλος 1: καμία απολύτως επιδείνωση γλώσσας/φύλου.
+            if deltas['delta_greek'] < 0 or deltas['delta_gender'] < 0:
+                return None
+            no_harm_keys = performance_keys + ['delta_greek', 'delta_gender']
+            if all(deltas[k] == 0 for k in no_harm_keys):
+                return None
+        else:
+            # Κύκλος 2: επιτρέπεται delta_greek/delta_gender < 0, αλλά ήδη
+            # εγγυημένο ότι δεν ξεπερνά το όριο (_smart_ok παραπάνω). Το
+            # swap πρέπει να βελτιώνει όντως κάποιο κριτήριο επίδοσης —
+            # αλλιώς δεν αξίζει να «θυσιαστεί» γλώσσα/φύλο.
+            if all(deltas[k] == 0 for k in performance_keys):
+                return None
+
+        imp = {
+            'improves': True,
+            **deltas,
+            'ep5_before': spreads_before['ep5'], 'ep5_after': spreads_after['ep5'],
+            'ep1_before': spreads_before['ep1'], 'ep1_after': spreads_after['ep1'],
+            'ep4_before': spreads_before['ep4'], 'ep4_after': spreads_after['ep4'],
+            'ep2_before': spreads_before['ep2'], 'ep2_after': spreads_after['ep2'],
+        }
+
+        return {
+            'type': swap_type,
+            'from_team': from_team,
+            'students_out': names_out,
+            'to_team': to_team,
+            'students_in': names_in,
+            'improvement': imp,
+            'priority': priority,
+            'cycle': cycle,
+        }
+
+    def _calc_spreads_after(self, stats_before: Dict, from_team: str, names_out: List[str],
+                             to_team: str, names_in: List[str]) -> Dict[str, int]:
+        """Υπολογισμός spreads μετά από υποθετική ανταλλαγή.
+
+        PERF FIX: παίρνει το stats_before έτοιμο (υπολογισμένο μία φορά ανά
+        iteration) αντί να καλεί self._get_team_stats() -- πλήρες πέρασμα O(N)
+        σε όλους τους μαθητές -- για κάθε υποψήφιο swap.
+        """
+        stats_after = {k: v.copy() for k, v in stats_before.items()}
+
+        def _remove(team: str, name: str) -> None:
+            if name not in self.students:
+                return
+            s = self.students[name]
+            if s.choice in {1, 2, 3, 4, 5}:
+                stats_after[team][f'ep{s.choice}'] -= 1
+            if s.gender == 'Α':
+                stats_after[team]['boys'] -= 1
+            elif s.gender == 'Κ':
+                stats_after[team]['girls'] -= 1
+            if s.greek_knowledge in ['Ν', 'N']:
+                stats_after[team]['greek_yes'] -= 1
+
+        def _add(team: str, name: str) -> None:
+            if name not in self.students:
+                return
+            s = self.students[name]
+            if s.choice in {1, 2, 3, 4, 5}:
+                stats_after[team][f'ep{s.choice}'] += 1
+            if s.gender == 'Α':
+                stats_after[team]['boys'] += 1
+            elif s.gender == 'Κ':
+                stats_after[team]['girls'] += 1
+            if s.greek_knowledge in ['Ν', 'N']:
+                stats_after[team]['greek_yes'] += 1
+
+        for name in names_out:
+            _remove(from_team, name)
+        for name in names_in:
+            _add(from_team, name)
+        for name in names_in:
+            _remove(to_team, name)
+        for name in names_out:
+            _add(to_team, name)
+
+        def _spread(key: str) -> int:
+            vals = [s[key] for s in stats_after.values()]
+            return max(vals) - min(vals) if vals else 0
+
+        return {
+            'ep5': _spread('ep5'),
+            'ep1': _spread('ep1'),
+            'ep4': _spread('ep4'),
+            'ep2': _spread('ep2'),
+            'ep3': _spread('ep3'),
+            'boys': _spread('boys'),
+            'girls': _spread('girls'),
+            'greek_yes': _spread('greek_yes'),
+        }
+
+    def _select_best_swap_hierarchical(self, swaps: List[Dict]) -> Optional[Dict]:
+        """
+        Ιεραρχημένη επιλογή βέλτιστης ανταλλαγής:
+        1. Μεγαλύτερη μείωση spread επίδοσης 5
+        2. Μεγαλύτερη μείωση spread επίδοσης 1
+        3. Μεγαλύτερη μείωση spread επίδοσης 4
+        4. Μεγαλύτερη μείωση spread επίδοσης 2
+        5. Μεγαλύτερη μείωση γλωσσικής επάρκειας
+        6. Μεγαλύτερη μείωση φύλου
+        """
+        if not swaps:
+            return None
+
+        swaps.sort(key=lambda x: (
+            -x['improvement']['delta_ep5'],
+            -x['improvement']['delta_ep1'],
+            -x['improvement']['delta_ep4'],
+            -x['improvement']['delta_ep2'],
+            -x['improvement']['delta_greek'],
+            -x['improvement']['delta_gender'],
+            x['priority']
+        ))
+
+        return swaps[0]
+
+    def _has_mutual_friend_in_team(self, name: str, team_name: str) -> bool:
+        """True αν ο μαθητής έχει πλήρως αμοιβαίο φίλο μέσα στο ίδιο τμήμα."""
+        if name not in self.students:
+            return False
+        student = self.students[name]
+        student_names = self.teams.get(team_name, [])
+        team_name_by_canon = {_canon_name(n): n for n in student_names}
+        for f in student.friends:
+            friend_name = team_name_by_canon.get(_canon_name(f))
+            if friend_name and friend_name in self.students:
+                if _name_in_list(name, self.students[friend_name].friends):
+                    return True
+        return False
+
+    def _get_movable_solos(self, team_name: str) -> List[Dict]:
+        """Μονάδες που μπορούν να μετακινηθούν: όχι locked και χωρίς αμοιβαία δυάδα στο τμήμα."""
+        solos = []
+        for name in self.teams.get(team_name, []):
+            if name not in self.students:
+                continue
+            student = self.students[name]
+            if student.locked:
+                continue
+            if self._has_mutual_friend_in_team(name, team_name):
+                continue
+            solos.append({'name': name, 'student': student})
+        return solos
+
+    def _get_movable_pairs(self, team_name: str) -> List[Dict]:
+        """Πλήρως αμοιβαίες δυάδες που μπορούν να μετακινηθούν μαζί: κανένας locked."""
+        pairs = []
+        processed = set()
+        student_names = self.teams.get(team_name, [])
+        for name_a in student_names:
+            if name_a in processed or name_a not in self.students:
+                continue
+            student_a = self.students[name_a]
+            if student_a.locked:
+                continue
+            for name_b in student_names:
+                if name_b == name_a or name_b in processed or name_b not in self.students:
+                    continue
+                student_b = self.students[name_b]
+                if student_b.locked:
+                    continue
+                if _are_mutual_friends(name_a, student_a.friends, name_b, student_b.friends):
+                    pairs.append({
+                        'name_a': name_a, 'name_b': name_b,
+                        'student_a': student_a, 'student_b': student_b,
+                        'ep_combo': f"{student_a.choice},{student_b.choice}"
+                    })
+                    processed.add(name_a)
+                    processed.add(name_b)
+                    break
+        return pairs
+
+    # Backward-compatible wrappers για παλιότερες κλήσεις/ονόματα.
+    def _get_solos_with_ep3(self, team_name: str) -> List[Dict]:
+        return [s for s in self._get_movable_solos(team_name) if s['student'].choice == 3]
+
+    def _get_solos_without_ep3(self, team_name: str) -> List[Dict]:
+        return [s for s in self._get_movable_solos(team_name) if s['student'].choice != 3]
+
+    def _get_pairs_with_ep3(self, team_name: str) -> List[Dict]:
+        return [p for p in self._get_movable_pairs(team_name) if p['student_a'].choice == 3 or p['student_b'].choice == 3]
+
+    def _get_pairs_without_ep3(self, team_name: str) -> List[Dict]:
+        return [p for p in self._get_movable_pairs(team_name) if p['student_a'].choice != 3 and p['student_b'].choice != 3]
+
+    def _calc_asymmetric_improvement(self, team_high: str, names_out: List[str],
+                                      team_low: str, names_in: List[str]) -> Dict:
+        """Backward-compatible improvement calculation με τη νέα ιεραρχία."""
+        stats_before = self._get_team_stats()
+        before = self._spreads_from_stats(stats_before)
+        after = self._calc_spreads_after(stats_before, team_high, names_out, team_low, names_in)
+        gender_before = max(before['boys'], before['girls'])
+        gender_after = max(after['boys'], after['girls'])
+        return {
+            'improves': any(before[k] - after[k] > 0 for k in ['ep5', 'ep1', 'ep4', 'ep2', 'greek_yes']) or gender_before - gender_after > 0,
+            'delta_ep5': before['ep5'] - after['ep5'],
+            'delta_ep1': before['ep1'] - after['ep1'],
+            'delta_ep4': before['ep4'] - after['ep4'],
+            'delta_ep2': before['ep2'] - after['ep2'],
+            'delta_ep3': before['ep3'] - after['ep3'],
+            'delta_boys': before['boys'] - after['boys'],
+            'delta_girls': before['girls'] - after['girls'],
+            'delta_greek': before['greek_yes'] - after['greek_yes'],
+            'delta_gender': gender_before - gender_after,
+        }
+
+
+    def _apply_swap(self, swap: Dict) -> None:
+        from_team = swap['from_team']
+        to_team = swap['to_team']
+        students_out = swap['students_out']
+        students_in = swap['students_in']
+        
+        for name in students_out:
+            if name in self.teams[from_team]:
+                self.teams[from_team].remove(name)
+        
+        for name in students_in:
+            if name in self.teams[to_team]:
+                self.teams[to_team].remove(name)
+        
+        for name in students_out:
+            self.teams[to_team].append(name)
+        
+        for name in students_in:
+            self.teams[from_team].append(name)
+    
+    def export_optimized_excel(self, applied_swaps: List[Dict], final_spreads: Dict, output_path: str) -> str:
+        """Εξαγωγή optimized Excel."""
+        wb = Workbook()
+        wb.remove(wb.active)
+        
+        for team_name in sorted(self.teams.keys()):
+            self._create_team_sheet(wb, team_name)
+        
+        self._create_statistics_sheet(wb, final_spreads)
+        self._create_swaps_log_sheet(wb, applied_swaps)
+        
+        wb.save(output_path)
+        wb.close()
+        
+        print(f"✅ Optimized Excel αποθηκεύτηκε: {output_path}")
+        return output_path
+    
+    def _create_team_sheet(self, wb: Workbook, team_name: str) -> None:
+        sheet = wb.create_sheet(team_name)
+
+        headers = [
+            'ΟΝΟΜΑ',
+            'ΦΥΛΟ',
+            'ΚΑΛΗ_ΓΝΩΣΗ_ΕΛΛΗΝΙΚΩΝ',
+            'ΕΠΙΔΟΣΗ',
+            'ΦΙΛΟΙ',
+            'ΠΡΟΑΙΡΕΤΙΚΟΣ_ΦΙΛΟΣ',
+            'ΠΑΙΔΙ_ΕΚΠΑΙΔΕΥΤΙΚΟΥ',
+            'ΖΩΗΡΟΣ',
+            'ΙΔΙΑΙΤΕΡΟΤΗΤΑ',
+            'ΣΥΓΚΡΟΥΣΗ',
+        ]
+        for col_idx, header in enumerate(headers, start=1):
+            cell = sheet.cell(1, col_idx)
+            cell.value = header
+            cell.font = Font(bold=True)
+            cell.fill = PatternFill(start_color='DDEBF7', fill_type='solid')
+            cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+
+        row_idx = 2
+        for name in sorted(self.teams[team_name]):
+            if name not in self.students:
+                continue
+
+            student = self.students[name]
+            source_student = self.students_data.get(name)
+
+            # Normalize greek_knowledge
+            greek_val = student.greek_knowledge
+            if greek_val in ['N', 'n']:
+                greek_val = 'Ν'
+            elif greek_val in ['O', 'o']:
+                greek_val = 'Ο'
+
+            sheet.cell(row_idx, 1).value = student.name
+            sheet.cell(row_idx, 2).value = student.gender
+            sheet.cell(row_idx, 3).value = greek_val
+            sheet.cell(row_idx, 4).value = student.choice
+            sheet.cell(row_idx, 5).value = ', '.join(student.friends)
+            sheet.cell(row_idx, 6).value = student.optional_friend
+            sheet.cell(row_idx, 7).value = source_student.teacher_child if source_student else 'Ο'
+            sheet.cell(row_idx, 8).value = source_student.calm if source_student else 'Ο'
+            sheet.cell(row_idx, 9).value = source_student.special_needs if source_student else 'Ο'
+            sheet.cell(row_idx, 10).value = ', '.join(student.conflict_names)
+
+            for col in range(1, 11):
+                sheet.cell(row_idx, col).alignment = Alignment(
+                    horizontal='left' if col in [1, 5, 6, 10] else 'center',
+                    vertical='center',
+                    wrap_text=(col in [5, 6, 10])
+                )
+
+            row_idx += 1
+
+        widths = {
+            'A': 30,
+            'B': 12,
+            'C': 25,
+            'D': 12,
+            'E': 40,
+            'F': 30,
+            'G': 24,
+            'H': 14,
+            'I': 20,
+            'J': 40,
+        }
+        for col_letter, width in widths.items():
+            sheet.column_dimensions[col_letter].width = width
+    
+    def _create_statistics_sheet(self, wb: Workbook, spreads: Dict) -> None:
+        """Δημιουργία πλήρους φύλλου ΒΕΛΤΙΩΜΕΝΗ_ΣΤΑΤΙΣΤΙΚΗ."""
+        sheet = wb.create_sheet('ΒΕΛΤΙΩΜΕΝΗ_ΣΤΑΤΙΣΤΙΚΗ')
+
+        headers = [
+            'Τμήμα', 'Σύνολο', 'Αγόρια', 'Κορίτσια',
+            'Γνώση (ΝΑΙ)', 'Γνώση (ΟΧΙ)',
+            'Παιδιά Εκπαιδευτικών', 'Ζωηροί', 'Ιδιαιτερότητα',
+            'Συγκρούσεις', 'Σπασμένες Φιλίες',
+            'Επ1', 'Επ2', 'Επ3', 'Επ4', 'Επ5'
+        ]
+
+        for col_idx, header in enumerate(headers, start=1):
+            cell = sheet.cell(1, col_idx)
+            cell.value = header
+            cell.font = Font(bold=True)
+            cell.fill = PatternFill(start_color='C6E0B4', fill_type='solid')
+            cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+
+        stats = self._get_team_stats()
+        row_idx = 2
+
+        for team_name in sorted(self.teams.keys()):
+            if team_name not in stats:
+                continue
+
+            s = stats[team_name]
+            values = [
+                team_name,
+                len(self.teams[team_name]),
+                s['boys'],
+                s['girls'],
+                s['greek_yes'],
+                s['greek_no'],
+                s['teacher_count'],
+                s['calm_count'],
+                s['special_count'],
+                s['conflict_violations'],
+                s['broken_friendships'],
+                s['ep1'],
+                s['ep2'],
+                s['ep3'],
+                s['ep4'],
+                s['ep5']
+            ]
+
+            for col_idx, value in enumerate(values, start=1):
+                sheet.cell(row_idx, col_idx).value = value
+                sheet.cell(row_idx, col_idx).alignment = Alignment(
+                    horizontal='center',
+                    vertical='center'
+                )
+            row_idx += 1
+
+        row_idx += 2
+        sheet.cell(row_idx, 1).value = 'ΤΕΛΙΚΑ SPREADS'
+        sheet.cell(row_idx, 1).font = Font(bold=True, size=12)
+        row_idx += 1
+
+        summary_headers = ['Μετρική', 'Spread', 'Στόχος', 'Status']
+        for col_idx, header in enumerate(summary_headers, start=1):
+            cell = sheet.cell(row_idx, col_idx)
+            cell.value = header
+            cell.font = Font(bold=True)
+            cell.fill = PatternFill(start_color='FFF2CC', fill_type='solid')
+
+        row_idx += 1
+
+        summary_data = [
+            ('1η προτεραιότητα: Spread Επίδοσης 5', spreads['ep5'], '≤ 2', '✅' if spreads['ep5'] <= 2 else '❌'),
+            ('2η προτεραιότητα: Spread Επίδοσης 1', spreads['ep1'], '≤ 2', '✅' if spreads['ep1'] <= 2 else '❌'),
+            ('3η προτεραιότητα: Spread Επίδοσης 4', spreads['ep4'], '≤ 2', '✅' if spreads['ep4'] <= 2 else '❌'),
+            ('4η προτεραιότητα: Spread Επίδοσης 2', spreads['ep2'], '≤ 2', '✅' if spreads['ep2'] <= 2 else '❌'),
+            ('Αναφορά: Spread Επίδοσης 3', spreads.get('ep3', 0), '—', 'ℹ️'),
+            ('Spread Γνώσης', spreads['greek_yes'], '≤ 2', '✅' if spreads['greek_yes'] <= 2 else '❌'),
+            ('Spread Αγοριών', spreads['boys'], '≤ 2', '✅' if spreads['boys'] <= 2 else '❌'),
+            ('Spread Κοριτσιών', spreads['girls'], '≤ 2', '✅' if spreads['girls'] <= 2 else '❌')
+        ]
+
+        for label, value, target, status in summary_data:
+            sheet.cell(row_idx, 1).value = label
+            sheet.cell(row_idx, 2).value = value
+            sheet.cell(row_idx, 3).value = target
+            sheet.cell(row_idx, 4).value = status
+
+            if '✅' in status:
+                sheet.cell(row_idx, 2).fill = PatternFill(start_color='C6EFCE', fill_type='solid')
+            elif '❌' in status:
+                sheet.cell(row_idx, 2).fill = PatternFill(start_color='FFC7CE', fill_type='solid')
+
+            row_idx += 1
+
+        widths = {
+            'A': 38, 'B': 12, 'C': 12, 'D': 12, 'E': 16, 'F': 16,
+            'G': 24, 'H': 14, 'I': 18, 'J': 16, 'K': 20,
+            'L': 10, 'M': 10, 'N': 10, 'O': 10, 'P': 10
+        }
+
+        for col_letter, width in widths.items():
+            sheet.column_dimensions[col_letter].width = width
+
+    def _create_swaps_log_sheet(self, wb: Workbook, swaps: List[Dict]) -> None:
+        sheet = wb.create_sheet('ΕΦΑΡΜΟΣΜΕΝΑ_SWAPS')
+
+        headers = ['#', 'Κύκλος', 'Τύπος', 'Από Τμήμα', 'Μαθητές OUT',
+                   'Προς Τμήμα', 'Μαθητές IN', 'Δ_ep5', 'Δ_ep1', 'Δ_ep4', 'Δ_ep2',
+                   'Δ_γνώσης', 'Δ_φύλου', 'Priority']
+
+        for col_idx, header in enumerate(headers, start=1):
+            cell = sheet.cell(1, col_idx)
+            cell.value = header
+            cell.font = Font(bold=True)
+            cell.fill = PatternFill(start_color='D9E1F2', fill_type='solid')
+            cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+
+        def _fmt_delta(v: int) -> str:
+            return f"+{v}" if v > 0 else str(v)
+
+        for idx, swap in enumerate(swaps, start=1):
+            imp = swap['improvement']
+            delta_gen = imp.get('delta_gender', imp.get('delta_boys', 0) + imp.get('delta_girls', 0))
+
+            values = [
+                idx,
+                swap.get('cycle', 1),
+                swap['type'],
+                swap['from_team'],
+                ', '.join(swap['students_out']),
+                swap['to_team'],
+                ', '.join(swap['students_in']),
+                _fmt_delta(imp.get('delta_ep5', 0)),
+                _fmt_delta(imp.get('delta_ep1', 0)),
+                _fmt_delta(imp.get('delta_ep4', 0)),
+                _fmt_delta(imp.get('delta_ep2', 0)),
+                _fmt_delta(imp.get('delta_greek', 0)),
+                _fmt_delta(delta_gen),
+                swap['priority'],
+            ]
+
+            for col_idx, value in enumerate(values, start=1):
+                sheet.cell(idx + 1, col_idx).value = value
+                sheet.cell(idx + 1, col_idx).alignment = Alignment(horizontal='center', vertical='center')
+
+        widths = [('A',8),('B',20),('C',15),('D',35),('E',15),('F',35),
+                  ('G',10),('H',10),('I',10),('J',10),('K',10),('L',10),('M',10)]
+        for col, width in widths:
+            sheet.column_dimensions[col].width = width
+
+    # ==================== HELPERS ====================
+    
+    def _parse_headers(self, sheet: Worksheet) -> Dict[str, int]:
+        """Normalization headers."""
+        headers = {}
+        for col_idx, cell in enumerate(sheet[1], start=1):
+            if cell.value:
+                raw_header = str(cell.value).strip()
+                headers[raw_header] = col_idx
+                normalized = raw_header.upper().replace(' ', '').replace('_', '')
+                headers[normalized] = col_idx
+        return headers
+    
+    def _parse_headers_fill(self, sheet: Worksheet) -> Dict[str, int]:
+        """Parse headers για fill phase."""
+        headers = {}
+        for col_idx, cell in enumerate(sheet[1], start=1):
+            if cell.value:
+                header = str(cell.value).strip()
+                headers[header] = col_idx
+        return headers
+    
+    def _get_cell_value(self, sheet: Worksheet, row: int, col: Optional[int], default: str = '') -> str:
+        if col is None:
+            return default
+        val = sheet.cell(row, col).value
+        return str(val).strip() if val is not None else default
+
+
+# ========== CLI ==========
+
+def _build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Βήμα 8: Fill + Optimize (χωρίς Streamlit)")
+    sub = p.add_subparsers(dest="mode", required=True, help="Λειτουργία")
+
+    # Fill mode
+    p_fill = sub.add_parser("fill", help="Fill template με δεδομένα")
+    p_fill.add_argument("--source", required=True, help="Excel με μαθητές (Παράδειγμα1.xlsx)")
+    p_fill.add_argument("--template", required=True, help="Template με τμήματα")
+    p_fill.add_argument("--out", required=True, help="Output path")
+
+    # Optimize mode
+    p_opt = sub.add_parser("optimize", help="Optimize filled Excel")
+    p_opt.add_argument("--input", required=True, help="Filled Excel")
+    p_opt.add_argument("--out", required=True, help="Output path")
+    p_opt.add_argument("--max-iter", type=int, default=100, help="Max iterations (default: 100)")
+    p_opt.add_argument(
+        "--allow-legacy-fallback", action="store_true",
+        help=(
+            "Αποδέξου input Excel από ΠΑΛΙΟ fill mode (χωρίς τις νέες raw "
+            "στήλες) με fallback σε defaults, αντί να σταματήσει με σφάλμα."
+        ),
+    )
+
+    # All mode
+    p_all = sub.add_parser("all", help="Fill + Optimize σε μία")
+    p_all.add_argument("--source", required=True)
+    p_all.add_argument("--template", required=True)
+    p_all.add_argument("--out", required=True)
+    p_all.add_argument("--max-iter", type=int, default=100, help="Max iterations")
+
+    return p
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    argv = argv if argv is not None else sys.argv[1:]
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+
+    try:
+        processor = UnifiedProcessor()
+
+        if args.mode == "fill":
+            print(f"📄 Mode: FILL")
+            processor.read_source_data(args.source)
+            processor.fill_target_excel(args.template, args.out)
+            
+            if processor.warnings:
+                print(f"\n⚠️  {len(processor.warnings)} warnings:")
+                for w in processor.warnings[:10]:
+                    print(f"  • {w}")
+            
+            return 0
+
+        elif args.mode == "optimize":
+            # FIX: πριν το mode αυτό ήταν αδρανές (μόνο print + return 1) και
+            # απαιτούσε το mode 'all'. Τώρα δουλεύει standalone πάνω σε ένα
+            # ήδη filled Excel (πρέπει να περιέχει τα sheets ΚΑΤΗΓΟΡΙΟΠΟΙΗΣΗ
+            # και/ή SINGLE, όπως τα παράγει το mode 'fill'), χωρίς να
+            # χρειάζεται το αρχικό source file.
+            print("📄 Mode: OPTIMIZE (standalone)")
+
+            processor.load_filled_data(
+                args.input, allow_legacy_fallback=args.allow_legacy_fallback
+            )
+            if not processor.students or not processor.teams:
+                print(
+                    "❌ Δεν βρέθηκαν δεδομένα μαθητών/τμημάτων στο input. "
+                    "Βεβαιώσου ότι το αρχείο περιέχει τα sheets "
+                    "ΚΑΤΗΓΟΡΙΟΠΟΙΗΣΗ/SINGLE (παράγονται από το mode 'fill').",
+                    file=sys.stderr,
+                )
+                return 1
+
+            spreads_before = processor.calculate_spreads()
+            print(f"\n📊 ΠΡΙΝ:")
+            print(f"  EP5 spread: {spreads_before['ep5']}")
+            print(f"  EP1 spread: {spreads_before['ep1']}")
+            print(f"  EP4 spread: {spreads_before['ep4']}")
+            print(f"  EP2 spread: {spreads_before['ep2']}")
+            print(f"  Boys spread: {spreads_before['boys']}")
+            print(f"  Girls spread: {spreads_before['girls']}")
+            print(f"  Greek spread: {spreads_before['greek_yes']}")
+
+            swaps, spreads_after = processor.optimize(max_iterations=args.max_iter)
+
+            print(f"\n📊 ΜΕΤΑ:")
+            print(f"  EP5 spread: {spreads_after['ep5']} {'✅' if spreads_after['ep5'] <= 2 else '❌'}")
+            print(f"  EP1 spread: {spreads_after['ep1']} {'✅' if spreads_after['ep1'] <= 2 else '❌'}")
+            print(f"  EP4 spread: {spreads_after['ep4']} {'✅' if spreads_after['ep4'] <= 2 else '❌'}")
+            print(f"  EP2 spread: {spreads_after['ep2']} {'✅' if spreads_after['ep2'] <= 2 else '❌'}")
+            print(f"  Boys spread: {spreads_after['boys']} {'✅' if spreads_after['boys'] <= 2 else '❌'}")
+            print(f"  Girls spread: {spreads_after['girls']} {'✅' if spreads_after['girls'] <= 2 else '❌'}")
+            print(f"  Greek spread: {spreads_after['greek_yes']} {'✅' if spreads_after['greek_yes'] <= 2 else '❌'}")
+
+            processor.export_optimized_excel(swaps, spreads_after, args.out)
+            print(f"\n🎉 Ολοκληρώθηκε! Swaps: {len(swaps)}")
+
+            if processor.warnings:
+                print(f"\n⚠️  {len(processor.warnings)} warnings:")
+                for w in processor.warnings[:10]:
+                    print(f"  • {w}")
+
+            return 0
+
+        elif args.mode == "all":
+            print(f"📄 Mode: ALL (Fill + Optimize)")
+            
+            # Phase 1: Fill
+            print("\n📋 Phase 1/2: Filling...")
+            processor.read_source_data(args.source)
+            temp_filled = args.out.replace('.xlsx', '_TEMP_FILLED.xlsx')
+            processor.fill_target_excel(args.template, temp_filled)
+            
+            # Phase 2: Optimize
+            print("\n🎯 Phase 2/2: Optimizing...")
+            processor.load_filled_data(temp_filled)
+            
+            spreads_before = processor.calculate_spreads()
+            print(f"\n📊 ΠΡΙΝ:")
+            print(f"  EP5 spread: {spreads_before['ep5']}")
+            print(f"  EP1 spread: {spreads_before['ep1']}")
+            print(f"  EP4 spread: {spreads_before['ep4']}")
+            print(f"  EP2 spread: {spreads_before['ep2']}")
+            print(f"  Boys spread: {spreads_before['boys']}")
+            print(f"  Girls spread: {spreads_before['girls']}")
+            print(f"  Greek spread: {spreads_before['greek_yes']}")
+            
+            swaps, spreads_after = processor.optimize(max_iterations=args.max_iter)
+            
+            print(f"\n📊 ΜΕΤΑ:")
+            print(f"  EP5 spread: {spreads_after['ep5']} {'✅' if spreads_after['ep5'] <= 2 else '❌'}")
+            print(f"  EP1 spread: {spreads_after['ep1']} {'✅' if spreads_after['ep1'] <= 2 else '❌'}")
+            print(f"  EP4 spread: {spreads_after['ep4']} {'✅' if spreads_after['ep4'] <= 2 else '❌'}")
+            print(f"  EP2 spread: {spreads_after['ep2']} {'✅' if spreads_after['ep2'] <= 2 else '❌'}")
+            print(f"  Boys spread: {spreads_after['boys']} {'✅' if spreads_after['boys'] <= 2 else '❌'}")
+            print(f"  Girls spread: {spreads_after['girls']} {'✅' if spreads_after['girls'] <= 2 else '❌'}")
+            print(f"  Greek spread: {spreads_after['greek_yes']} {'✅' if spreads_after['greek_yes'] <= 2 else '❌'}")
+            
+            processor.export_optimized_excel(swaps, spreads_after, args.out)
+            
+            # Cleanup temp file
+            Path(temp_filled).unlink(missing_ok=True)
+            
+            print(f"\n🎉 Ολοκληρώθηκε! Swaps: {len(swaps)}")
+            
+            if processor.warnings:
+                print(f"\n⚠️  {len(processor.warnings)} warnings:")
+                for w in processor.warnings[:10]:
+                    print(f"  • {w}")
+            
+            return 0
+
+    except FileNotFoundError as e:
+        print(f"❌ Σφάλμα: Δεν βρέθηκε αρχείο - {e}", file=sys.stderr)
+        return 1
+    except LegacyExcelFormatError as e:
+        print(f"❌ Ασύμβατο (legacy) format Excel: {e}", file=sys.stderr)
+        return 3
+    except Exception as e:
+        print(f"❌ Απρόσμενο σφάλμα: {e}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
