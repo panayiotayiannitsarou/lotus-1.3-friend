@@ -301,6 +301,8 @@ def _story_md():
 """
 
 STEP8_MODULE_CANDIDATES = [
+    ROOT / "step8_fixed_final_SECOND_CHOICE_MAX2_PPED.py",
+    ROOT / "step8_fixed_final_OPTIONAL_FRIEND_MAX2_PPED.py",
     ROOT / "step8_fixed_final_OPTIONAL_FRIEND.py",
     ROOT / "step8_fixed_final.py",
 ]
@@ -392,11 +394,11 @@ with colC:
             min_classes = max(2, math.ceil(N/25)) if N else 0
             st.metric("Μαθητές / Ελάχιστα τμήματα", f"{N} / {min_classes}")
             _preview_headers = {str(c).strip().upper() for c in df_preview.columns}
-            if "ΠΡΟΑΙΡΕΤΙΚΟΣ_ΦΙΛΟΣ" in _preview_headers:
-                st.caption("✅ Αναγνωρίστηκε η στήλη ΠΡΟΑΙΡΕΤΙΚΟΣ_ΦΙΛΟΣ.")
+            if "ΔΕΥΤΕΡΗ_ΕΠΙΛΟΓΗ" in _preview_headers:
+                st.caption("✅ Αναγνωρίστηκε η στήλη ΔΕΥΤΕΡΗ_ΕΠΙΛΟΓΗ.")
             else:
                 st.caption(
-                    "ℹ️ Δεν υπάρχει στήλη ΠΡΟΑΙΡΕΤΙΚΟΣ_ΦΙΛΟΣ. "
+                    "ℹ️ Δεν υπάρχει στήλη ΔΕΥΤΕΡΗ_ΕΠΙΛΟΓΗ. "
                     "Η κύρια κατανομή θα εκτελεστεί, αλλά ο Κύκλος 3 κοινωνικής αποκατάστασης δεν θα έχει δηλώσεις να εξετάσει."
                 )
         except Exception:
@@ -489,9 +491,9 @@ if st.button("🚀 ΕΚΤΕΛΕΣΗ ΚΑΤΑΝΟΜΗΣ", type="primary", use_con
             # Δεν αλλάζουμε το step7_fixed_final.py εδώ· απλώς προστατεύουμε την τελική επιλογή μέσα στο app.
             df_input_full = pd.read_excel(input_path, sheet_name=0)
             _input_headers = {str(c).strip().upper() for c in df_input_full.columns}
-            if "ΠΡΟΑΙΡΕΤΙΚΟΣ_ΦΙΛΟΣ" not in _input_headers:
+            if "ΔΕΥΤΕΡΗ_ΕΠΙΛΟΓΗ" not in _input_headers:
                 st.info(
-                    "ℹ️ Η στήλη ΠΡΟΑΙΡΕΤΙΚΟΣ_ΦΙΛΟΣ δεν βρέθηκε. "
+                    "ℹ️ Η στήλη ΔΕΥΤΕΡΗ_ΕΠΙΛΟΓΗ δεν βρέθηκε. "
                     "Τα Βήματα 1–7 θα εκτελεστούν κανονικά και το Βήμα 8 θα παραλείψει ουσιαστικά τον Κύκλο 3."
                 )
             conflict_data = cg.extract_conflict_data(df_input_full, warn_if_missing_col=True, warn_unresolved=True)
@@ -1015,8 +1017,8 @@ if xl is not None:
             missing_cols = [c for c in required_cols if c not in used_df.columns]
             st.write("Λείπουν στήλες:", missing_cols if missing_cols else "—")
             st.write(
-                "ΠΡΟΑΙΡΕΤΙΚΟΣ_ΦΙΛΟΣ:",
-                "✅ διαθέσιμη" if "ΠΡΟΑΙΡΕΤΙΚΟΣ_ΦΙΛΟΣ" in used_df.columns else "— δεν δηλώθηκε",
+                "ΔΕΥΤΕΡΗ_ΕΠΙΛΟΓΗ:",
+                "✅ διαθέσιμη" if "ΔΕΥΤΕΡΗ_ΕΠΙΛΟΓΗ" in used_df.columns else "— δεν δηλώθηκε",
             )
         if missing_cols:
             st.info("Συμπλήρωσε/διόρθωσε τις στήλες που λείπουν στο Excel και ξαναφόρτωσέ το.")
@@ -1136,7 +1138,7 @@ if st.session_state.get("last_final_path"):
                                 imp = swap.get("improvement", {})
                                 rows.append({
                                     "ΚΛΕΙΔΩΜΕΝΟΣ_ΜΑΘΗΤΗΣ": imp.get("locked_student", ""),
-                                    "ΠΡΟΑΙΡΕΤΙΚΟΣ_ΦΙΛΟΣ": imp.get("optional_friend", ""),
+                                    "ΔΕΥΤΕΡΗ_ΕΠΙΛΟΓΗ": imp.get("optional_friend", ""),
                                     "ΑΠΟ_ΤΜΗΜΑ": swap.get("from_team", ""),
                                     "ΠΡΟΣ_ΤΜΗΜΑ": swap.get("to_team", ""),
                                     "ΤΥΠΟΣ": swap.get("type", ""),

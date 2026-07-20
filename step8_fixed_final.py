@@ -151,6 +151,7 @@ class UnifiedProcessor:
                 # 1ο όνομα = πρώτη επιλογή, 2ο όνομα = εναλλακτική επιλογή.
                 optional_friend = ""
                 for variant in [
+                    'ΔΕΥΤΕΡΗ_ΕΠΙΛΟΓΗ', 'ΔΕΥΤΕΡΗ ΕΠΙΛΟΓΗ',
                     'ΠΡΟΑΙΡΕΤΙΚΟΣ_ΦΙΛΟΣ', 'ΠΡΟΑΙΡΕΤΙΚΟΣ ΦΙΛΟΣ',
                     'ΦΙΛΟΣ_2', 'ΦΙΛΟΣ 2', 'ΔΕΥΤΕΡΗ_ΕΠΙΛΟΓΗ_ΦΙΛΟΥ'
                 ]:
@@ -325,8 +326,8 @@ class UnifiedProcessor:
         # sheet να είναι αυτοτελές (self-contained) και το standalone 'optimize'
         # mode να μη χρειάζεται πλέον το αρχικό source file (self.students_data).
         headers = ['ΜΑΘΗΤΗΣ Α', 'ΜΑΘΗΤΗΣ Β', 'ΚΑΤΗΓΟΡΙΑ ΔΥΑΔΑΣ', 'ΕΠΙΔΟΣΗ', 'LOCKED', 'ΤΜΗΜΑ',
-                   'ΦΥΛΟ_Α', 'ΓΝΩΣΗ_Α', 'ΣΥΓΚΡΟΥΣΗ_Α', 'ΠΡΟΑΙΡΕΤΙΚΟΣ_ΦΙΛΟΣ_Α',
-                   'ΦΥΛΟ_Β', 'ΓΝΩΣΗ_Β', 'ΣΥΓΚΡΟΥΣΗ_Β', 'ΠΡΟΑΙΡΕΤΙΚΟΣ_ΦΙΛΟΣ_Β']
+                   'ΦΥΛΟ_Α', 'ΓΝΩΣΗ_Α', 'ΣΥΓΚΡΟΥΣΗ_Α', 'ΔΕΥΤΕΡΗ_ΕΠΙΛΟΓΗ_Α',
+                   'ΦΥΛΟ_Β', 'ΓΝΩΣΗ_Β', 'ΣΥΓΚΡΟΥΣΗ_Β', 'ΔΕΥΤΕΡΗ_ΕΠΙΛΟΓΗ_Β']
         for col_idx, header in enumerate(headers, start=1):
             cell = cat_sheet.cell(1, col_idx)
             cell.value = header
@@ -461,7 +462,7 @@ class UnifiedProcessor:
         # FIX: προστέθηκε στήλη ΣΥΓΚΡΟΥΣΗ ώστε το SINGLE sheet να είναι επίσης
         # αυτοτελές (self-contained) όπως το ΚΑΤΗΓΟΡΙΟΠΟΙΗΣΗ.
         headers = ['ΟΝΟΜΑ', 'ΦΥΛΟ', 'ΚΑΛΗ_ΓΝΩΣΗ_ΕΛΛΗΝΙΚΩΝ', 'ΕΠΙΔΟΣΗ', 'ΚΑΤΗΓΟΡΙΑ SINGLE',
-                   'ΤΜΗΜΑ', 'LOCKED', 'ΣΥΓΚΡΟΥΣΗ', 'ΠΡΟΑΙΡΕΤΙΚΟΣ_ΦΙΛΟΣ']
+                   'ΤΜΗΜΑ', 'LOCKED', 'ΣΥΓΚΡΟΥΣΗ', 'ΔΕΥΤΕΡΗ_ΕΠΙΛΟΓΗ']
         for col_idx, header in enumerate(headers, start=1):
             cell = single_sheet.cell(1, col_idx)
             cell.value = header
@@ -656,8 +657,8 @@ class UnifiedProcessor:
                 conflicts_b_raw = self._get_cell_value(sheet, row_idx, headers.get('ΣΥΓΚΡΟΥΣΗΒ'))
                 conflicts_a = _split_name_list(conflicts_a_raw)
                 conflicts_b = _split_name_list(conflicts_b_raw)
-                optional_a = str(self._get_cell_value(sheet, row_idx, headers.get('ΠΡΟΑΙΡΕΤΙΚΟΣΦΙΛΟΣΑ'), '') or '').strip()
-                optional_b = str(self._get_cell_value(sheet, row_idx, headers.get('ΠΡΟΑΙΡΕΤΙΚΟΣΦΙΛΟΣΒ'), '') or '').strip()
+                optional_a = str(self._get_cell_value(sheet, row_idx, headers.get('ΔΕΥΤΕΡΗΕΠΙΛΟΓΗΑ'), '') or '').strip()
+                optional_b = str(self._get_cell_value(sheet, row_idx, headers.get('ΔΕΥΤΕΡΗΕΠΙΛΟΓΗΒ'), '') or '').strip()
                 locked_val = self._get_cell_value(sheet, row_idx, headers.get('LOCKED'))
                 is_locked = (locked_val == 'LOCKED')
             else:
@@ -761,7 +762,7 @@ class UnifiedProcessor:
                     if name in self.students_data else []
                 )
 
-            optional_col = headers.get('ΠΡΟΑΙΡΕΤΙΚΟΣΦΙΛΟΣ')
+            optional_col = headers.get('ΔΕΥΤΕΡΗΕΠΙΛΟΓΗ')
             optional_names = _split_name_list(
                 self._get_cell_value(sheet, row_idx, optional_col, '')
             )
@@ -1016,9 +1017,9 @@ class UnifiedProcessor:
         # ---- ΚΥΚΛΟΣ 3: κοινωνική αποκατάσταση μέσω προαιρετικού φίλου ----
         # Ο εντοπισμός αφορά ΜΟΝΟ locked μαθητές με σπασμένη βασική αμοιβαία
         # φιλία. Οι locked μαθητές δεν μετακινούνται ποτέ. Μετακινείται προς
-        # το τμήμα τους ο προαιρετικός φίλος είτε ως solo είτε μαζί με την
+        # το τμήμα τους ο δεύτερη επιλογή είτε ως solo είτε μαζί με την
         # αδιαίρετη βασική αμοιβαία δυάδα του.
-        print("\n➡️  Κύκλος 3/3 (προαιρετικός φίλος για locked μαθητές με σπασμένη φιλία)...")
+        print("\n➡️  Κύκλος 3/3 (δεύτερη επιλογή για locked μαθητές με σπασμένη φιλία)...")
         cycle3_swaps = self._run_optional_friend_cycle(MAX_EP, MAX_GR, MAX_GEN)
         applied_swaps.extend(cycle3_swaps)
 
@@ -1185,7 +1186,7 @@ class UnifiedProcessor:
         Κύκλος 3: φέρνει προς τον locked μαθητή τον πρώτο νόμιμο
         προαιρετικό φίλο, ποτέ τον locked μαθητή προς τον φίλο.
 
-        Η στήλη ΠΡΟΑΙΡΕΤΙΚΟΣ_ΦΙΛΟΣ δέχεται έως 2 ονόματα με σειρά
+        Η στήλη ΔΕΥΤΕΡΗ_ΕΠΙΛΟΓΗ δέχεται έως 2 ονόματα με σειρά
         προτεραιότητας. Το δεύτερο εξετάζεται μόνο όταν το πρώτο δεν μπορεί
         να μετακινηθεί νόμιμα.
         """
@@ -1212,7 +1213,7 @@ class UnifiedProcessor:
                 )
                 if not optional_name:
                     self.warnings.append(
-                        f"⚠️ {locked_name}: ο προαιρετικός φίλος επιλογής "
+                        f"⚠️ {locked_name}: ο δεύτερη επιλογή επιλογής "
                         f"{choice_index} ({optional_ref}) δεν βρέθηκε στους μαθητές."
                     )
                     continue
@@ -1224,7 +1225,7 @@ class UnifiedProcessor:
                 # Ήδη μαζί: η κοινωνική υποστήριξη υπάρχει χωρίς μετακίνηση.
                 if optional_team == locked_team:
                     print(
-                        f"   ✅ {locked_name}: ο προαιρετικός φίλος επιλογής "
+                        f"   ✅ {locked_name}: ο δεύτερη επιλογή επιλογής "
                         f"{choice_index} ({optional_name}) βρίσκεται ήδη στο {locked_team}."
                     )
                     restored = True
@@ -1796,7 +1797,7 @@ class UnifiedProcessor:
             'ΚΑΛΗ_ΓΝΩΣΗ_ΕΛΛΗΝΙΚΩΝ',
             'ΕΠΙΔΟΣΗ',
             'ΦΙΛΟΙ',
-            'ΠΡΟΑΙΡΕΤΙΚΟΣ_ΦΙΛΟΣ',
+            'ΔΕΥΤΕΡΗ_ΕΠΙΛΟΓΗ',
             'ΠΑΙΔΙ_ΕΚΠΑΙΔΕΥΤΙΚΟΥ',
             'ΖΩΗΡΟΣ',
             'ΙΔΙΑΙΤΕΡΟΤΗΤΑ',
